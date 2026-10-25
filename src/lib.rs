@@ -24,6 +24,6 @@ pub use element::{Element, Node};
 pub use extract::{Card, Extract, ExtractBuilder, Records, Type};
 pub use error::{Error, Result};
 pub use path::{Hits, Limits, Match, Matcher, Overflow, Select, Selector, SelectorSet};
-pub use reader::{Event, Options, Reader};
+pub use reader::{Event, EventRef, EventSource, IterSource, Options, Reader};
 pub use writer::Writer;
 pub use value::{Record, Value};

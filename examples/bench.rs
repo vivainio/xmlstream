@@ -1,5 +1,5 @@
 //! `cargo run --release --example bench -- FILE MODE`
-//! Modes: events, attr, text, element, extract, extract_wide, extract_many
+//! Modes: events, events_ref, attr, text, element, extract, extract_wide, extract_many
 
 use std::{fs::File, time::Instant};
 
@@ -14,6 +14,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let t = Instant::now();
     let n: usize = match mode.as_str() {
         "events" => reader.map(|e| e.map(|_| 1)).sum::<Result<usize, _>>()?,
+        "events_ref" => {
+            let mut r = reader;
+            let mut n = 0;
+            while r.next_ref()?.is_some() {
+                n += 1;
+            }
+            n
+        }
         "attr" => Selector::parse("//order/@id")?.select(reader).count(),
         "text" => Selector::parse("//order/sku/text()")?.select(reader).count(),
         "element" => Selector::parse("//order")?.select(reader).count(),

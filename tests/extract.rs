@@ -342,3 +342,41 @@ fn matcher_and_select_events() {
     }
     assert_eq!(ids, ["1", "2", "3", "4"]);
 }
+
+#[test]
+fn borrowed_reader_matches_owned_and_reuses_buffers_safely() {
+    // attribute counts go 3 -> 0 -> 1 -> 2 so reused slots must not leak old values;
+    // text is split by entities, CDATA and a comment; empty elements owe an end tag
+    let xml = "<r a='1' b='2' c='3'><e/><f z='9'>x &amp; y<![CDATA[<z>]]><!--k-->tail</f><g p='1' q='2'/></r>";
+    let owned: Vec<Event> = Reader::from_str(xml).map(|e| e.unwrap()).collect();
+    let mut r = Reader::from_str(xml);
+    let mut borrowed = vec![];
+    while let Some(ev) = r.next_ref().unwrap() {
+        borrowed.push(ev.to_event());
+    }
+    assert_eq!(owned, borrowed);
+    assert_eq!(
+        owned[1],
+        Event::Start { name: "e".into(), attrs: vec![] },
+        "{owned:?}"
+    );
+    assert!(owned.contains(&Event::Text("x & y".into())));
+    assert!(owned.contains(&Event::Start {
+        name: "g".into(),
+        attrs: vec![("p".into(), "1".into()), ("q".into(), "2".into())]
+    }));
+    // trimming works in place too
+    let t: Vec<Event> = Reader::from_str("<a>\n  <b> x </b>\n  y \n</a>").trim(true).map(|e| e.unwrap()).collect();
+    assert!(t.contains(&Event::Text("x".into())) && t.contains(&Event::Text("y".into())), "{t:?}");
+}
+
+#[test]
+fn borrowed_events_feed_writer_without_owning() {
+    let xml = r#"<a x="1 &amp; 2"><b>t&lt;</b><![CDATA[c]]><!--k--><e/></a>"#;
+    let mut r = Reader::from_str(xml);
+    let mut w = Writer::new(Vec::new());
+    while let Some(ev) = r.next_ref().unwrap() {
+        w.write_event_ref(ev).unwrap();
+    }
+    assert_eq!(String::from_utf8(w.finish().unwrap()).unwrap(), xml);
+}

@@ -44,12 +44,12 @@
 //! `@id` its own attribute (fields are separated by a newline or `;`), `text()` its own text and `.` all its text. When a one-valued field
 //! matches several times, the first match wins.
 
-use std::{collections::VecDeque, io::Read};
+use std::{collections::VecDeque, io::Read, sync::Arc};
 
 use crate::{
     error::{Error, Result},
     path::{Engine, Limits, Matcher, Selector, SelectorSet},
-    reader::{Event, Reader},
+    reader::{EventRef, Reader},
     value::{Record, Value},
 };
 
@@ -230,7 +230,7 @@ impl ExtractBuilder {
             let mut fieldset = SelectorSet::new();
             let mut fields: Vec<Field> = Vec::new();
             for f in spec.fields {
-                if fields.iter().any(|g| g.name == f.name) {
+                if fields.iter().any(|g| &*g.name == f.name.as_str()) {
                     return Err(Error::Path(format!("{label}: duplicate field {:?}", f.name)));
                 }
                 let source = match f.path.trim() {
@@ -248,7 +248,7 @@ impl ExtractBuilder {
                     }
                 };
                 fields.push(Field {
-                    name: f.name,
+                    name: f.name.into(),
                     source,
                     ty: f.ty,
                     card: f.card,
@@ -256,9 +256,12 @@ impl ExtractBuilder {
             }
             sels.push(sel);
             rules.push(Rule {
-                name: spec.name,
+                name: spec.name.map(Arc::from),
+                needs_attrs: fields.iter().any(|f| matches!(f.source, Source::Attr(_))),
+                shared: (!fieldset.is_empty()).then(|| fieldset.shared()),
+                needs_own_text: fields.iter().any(|f| matches!(f.source, Source::OwnText)),
+                needs_all_text: fields.iter().any(|f| matches!(f.source, Source::AllText)),
                 fields,
-                fieldset,
             });
         }
         Ok(Extract { rules, sels })
@@ -275,16 +278,20 @@ enum Source {
 }
 
 struct Field {
-    name: String,
+    name: Arc<str>,
     source: Source,
     ty: Type,
     card: Card,
 }
 
 struct Rule {
-    name: Option<String>,
+    name: Option<Arc<str>>,
+    needs_attrs: bool,
     fields: Vec<Field>,
-    fieldset: SelectorSet,
+    /// The field selectors, shared by every record's matcher.
+    shared: Option<Arc<[Selector]>>,
+    needs_own_text: bool,
+    needs_all_text: bool,
 }
 
 pub struct Extract {
@@ -306,8 +313,10 @@ impl Extract {
         Records {
             ex: self,
             reader,
-            engine: Engine::new(self.sels.clone(), Limits::default()),
+            engine: Engine::new(self.sels.clone().into(), Limits::default()),
+            pools: self.rules.iter().map(|_| Vec::new()).collect(),
             live: Vec::new(),
+            vals: Vec::new(),
             queue: VecDeque::new(),
             done: false,
         }
@@ -323,6 +332,8 @@ struct Live {
     /// Nesting inside the record element; 0 until its start tag has been seen.
     cur: usize,
     attrs: Vec<(String, String)>,
+    /// Live entries of `attrs`; the rest are spare strings kept for reuse.
+    n_attrs: usize,
     own_text: String,
     all_text: String,
     matcher: Option<Matcher>,
@@ -335,60 +346,97 @@ pub struct Records<'e, R: Read> {
     ex: &'e Extract,
     reader: Reader<R>,
     engine: Engine,
+    /// Per rule: state of finished records, kept so its buffers are reused.
+    pools: Vec<Vec<Live>>,
     live: Vec<Live>,
+    /// Scratch space for one field's raw values.
+    vals: Vec<String>,
     queue: VecDeque<Record>,
     done: bool,
 }
 
+fn new_live(ex: &Extract, pool: &mut Vec<Live>, si: usize, attrs: &[(String, String)]) -> Live {
+    let rule = &ex.rules[si];
+    let mut l = pool.pop().unwrap_or_else(|| Live {
+        rule: si,
+        cur: 0,
+        attrs: Vec::new(),
+        n_attrs: 0,
+        own_text: String::new(),
+        all_text: String::new(),
+        matcher: rule
+            .shared
+            .as_ref()
+            .map(|s| Matcher::from_shared(s.clone(), Limits::default())),
+        found: vec![Vec::new(); rule.shared.as_ref().map_or(0, |s| s.len())],
+    });
+    l.cur = 0;
+    l.n_attrs = 0;
+    if rule.needs_attrs {
+        for (k, v) in attrs {
+            if let Some(slot) = l.attrs.get_mut(l.n_attrs) {
+                slot.0.clear();
+                slot.0.push_str(k);
+                slot.1.clear();
+                slot.1.push_str(v);
+            } else {
+                l.attrs.push((k.clone(), v.clone()));
+            }
+            l.n_attrs += 1;
+        }
+    }
+    l
+}
+
 impl<R: Read> Records<'_, R> {
     fn step(&mut self) -> Result<bool> {
-        let Some(ev) = self.reader.next_event()? else {
+        let Some(ev) = self.reader.next_ref()? else {
             return Ok(false);
         };
-        let mut starting = Vec::new();
+        let (ex, pools, live) = (self.ex, &mut self.pools, &mut self.live);
         self.engine
-            .feed(&ev, &mut VecDeque::new(), &mut |si, attrs| {
-                starting.push((si, attrs.to_vec()));
+            .feed(ev, &mut VecDeque::new(), &mut |si, attrs| {
+                live.push(new_live(ex, &mut pools[si], si, attrs));
                 false // never buffer: the fields are collected as events pass
             })?;
-        for (si, attrs) in starting {
-            let rule = &self.ex.rules[si];
-            self.live.push(Live {
-                rule: si,
-                cur: 0,
-                attrs,
-                own_text: String::new(),
-                all_text: String::new(),
-                matcher: (!rule.fieldset.is_empty()).then(|| rule.fieldset.matcher()),
-                found: vec![Vec::new(); rule.fieldset.len()],
-            });
-        }
 
         let mut i = 0;
         while i < self.live.len() {
             let l = &mut self.live[i];
             let (depth, next) = match ev {
-                Event::Start { .. } => (l.cur, l.cur + 1),
-                Event::End { .. } => (l.cur - 1, l.cur - 1),
+                EventRef::Start { .. } => (l.cur, l.cur + 1),
+                EventRef::End { .. } => (l.cur - 1, l.cur - 1),
                 _ => (l.cur, l.cur),
             };
             l.cur = next;
-            if let Event::Text(t) | Event::CData(t) = &ev {
-                l.all_text.push_str(t);
-                if depth == 1 {
+            if let EventRef::Text(t) | EventRef::CData(t) = ev {
+                let rule = &self.ex.rules[l.rule];
+                if rule.needs_all_text {
+                    l.all_text.push_str(t);
+                }
+                if rule.needs_own_text && depth == 1 {
                     l.own_text.push_str(t);
                 }
             }
             if depth >= 1 {
                 if let Some(m) = &mut l.matcher {
-                    for (idx, hit) in m.feed(&ev)? {
-                        l.found[idx].push(hit.to_text());
-                    }
+                    let found = &mut l.found;
+                    m.feed_with(ev, |idx, hit| found[idx].push(hit.into_text()))?;
                 }
             }
             if next == 0 {
-                let l = self.live.remove(i);
-                self.queue.push_back(finish(&self.ex.rules[l.rule], l)?);
+                let mut l = self.live.remove(i);
+                let rec = finish(&self.ex.rules[l.rule], &mut l, &mut self.vals)?;
+                l.own_text.clear();
+                l.all_text.clear();
+                for f in &mut l.found {
+                    f.clear();
+                }
+                if let Some(m) = &mut l.matcher {
+                    m.reset();
+                }
+                self.pools[l.rule].push(l);
+                self.queue.push_back(rec);
             } else {
                 i += 1;
             }
@@ -420,37 +468,54 @@ impl<R: Read> Iterator for Records<'_, R> {
     }
 }
 
-fn finish(rule: &Rule, l: Live) -> Result<Record> {
+fn label(rule: &Rule, index: usize) -> String {
+    rule.name
+        .as_deref()
+        .map_or_else(|| format!("rule {index}"), str::to_string)
+}
+
+fn finish(rule: &Rule, l: &mut Live, vals: &mut Vec<String>) -> Result<Record> {
     let mut fields = Vec::with_capacity(rule.fields.len());
     for f in &rule.fields {
-        if let Source::Const(v) = &f.source {
-            fields.push((f.name.clone(), v.clone()));
-            continue;
+        vals.clear();
+        match &f.source {
+            Source::Const(v) => {
+                fields.push((f.name.clone(), v.clone()));
+                continue;
+            }
+            Source::Attr(a) => {
+                if let Some((_, v)) = l.attrs[..l.n_attrs].iter().find(|(k, _)| k == a) {
+                    vals.push(v.clone());
+                }
+            }
+            Source::OwnText => {
+                if !l.own_text.is_empty() {
+                    vals.push(std::mem::take(&mut l.own_text));
+                }
+            }
+            Source::AllText => {
+                if !l.all_text.is_empty() {
+                    vals.push(std::mem::take(&mut l.all_text));
+                }
+            }
+            Source::Path(i) => vals.extend(l.found[*i].drain(..)),
         }
-        let mut vals: Vec<String> = match &f.source {
-            Source::Attr(a) => l
-                .attrs
-                .iter()
-                .find(|(k, _)| k == a)
-                .map(|(_, v)| v.clone())
-                .into_iter()
-                .collect(),
-            Source::OwnText if !l.own_text.is_empty() => vec![l.own_text.clone()],
-            Source::AllText if !l.all_text.is_empty() => vec![l.all_text.clone()],
-            Source::OwnText | Source::AllText | Source::Const(_) => Vec::new(),
-            Source::Path(i) => l.found[*i].clone(),
+        let missing = || {
+            Error::Extract(format!(
+                "{}: field {:?} not found",
+                label(rule, l.rule),
+                &*f.name
+            ))
         };
-        let label = || rule.name.clone().unwrap_or_else(|| format!("rule {}", l.rule));
-        let missing = || Error::Extract(format!("{}: field {:?} not found", label(), f.name));
         let value = match f.card {
             Card::One => {
                 if vals.is_empty() {
                     return Err(missing());
                 }
-                convert(f, &vals.swap_remove(0), &label())?
+                convert(f, vals.swap_remove(0), rule, l.rule)?
             }
-            Card::Optional => match vals.first() {
-                Some(v) => convert(f, v, &label())?,
+            Card::Optional => match vals.drain(..).next() {
+                Some(v) => convert(f, v, rule, l.rule)?,
                 None => Value::Null,
             },
             Card::OneOrMore | Card::Many => {
@@ -458,8 +523,8 @@ fn finish(rule: &Rule, l: Live) -> Result<Record> {
                     return Err(missing());
                 }
                 Value::List(
-                    vals.iter()
-                        .map(|v| convert(f, v, &label()))
+                    vals.drain(..)
+                        .map(|v| convert(f, v, rule, l.rule))
                         .collect::<Result<_>>()?,
                 )
             }
@@ -473,16 +538,17 @@ fn finish(rule: &Rule, l: Live) -> Result<Record> {
     })
 }
 
-fn convert(f: &Field, raw: &str, label: &str) -> Result<Value> {
+fn convert(f: &Field, raw: String, rule: &Rule, index: usize) -> Result<Value> {
     let bad = |what: &str| {
         Error::Extract(format!(
-            "{label}: field {:?}: {raw:?} is not {what}",
-            f.name
+            "{}: field {:?}: {raw:?} is not {what}",
+            label(rule, index),
+            &*f.name
         ))
     };
     let t = raw.trim();
     Ok(match f.ty {
-        Type::Text => Value::Text(raw.to_string()),
+        Type::Text => Value::Text(raw),
         Type::Int => Value::Int(t.parse().map_err(|_| bad("an integer"))?),
         Type::Number => match t.parse::<f64>() {
             Ok(n) if n.is_finite() => Value::Number(n),

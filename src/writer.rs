@@ -7,7 +7,7 @@ use std::io::Write;
 use crate::{
     element::{Element, Node},
     error::{Error, Result},
-    reader::Event,
+    reader::{Event, EventRef},
 };
 
 const FLUSH_AT: usize = 64 * 1024;
@@ -293,12 +293,18 @@ impl<W: Write> Writer<W> {
 
     /// Re-emit a reader event; makes `Reader` → `Writer` transforms a one-liner.
     pub fn write_event(&mut self, ev: &Event) -> Result<()> {
+        self.write_event_ref(ev.as_ref())
+    }
+
+    /// Like [`write_event`](Self::write_event), for events borrowed from a `Reader::next_ref`
+    /// loop, so a transform copies a stream without allocating per event.
+    pub fn write_event_ref(&mut self, ev: EventRef<'_>) -> Result<()> {
         match ev {
-            Event::Start { name, attrs } => self.start_with(name, attrs),
-            Event::End { .. } => self.end(),
-            Event::Text(t) => self.text(t),
-            Event::CData(t) => self.cdata(t),
-            Event::Comment(t) => self.comment(t),
+            EventRef::Start { name, attrs } => self.start_with(name, attrs),
+            EventRef::End { .. } => self.end(),
+            EventRef::Text(t) => self.text(t),
+            EventRef::CData(t) => self.cdata(t),
+            EventRef::Comment(t) => self.comment(t),
         }
     }
 

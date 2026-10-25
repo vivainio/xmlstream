@@ -153,3 +153,23 @@ fn records_stream_without_building_the_subtree() {
     assert_eq!(rec["first"].as_str(), Some("0"));
     assert_eq!(rec["n"].as_list().unwrap().len(), 200_000);
 }
+
+#[test]
+fn per_record_state_never_leaks_into_the_next_record() {
+    // records reuse buffers: a value present in one record must not show up in the next
+    let xml = "<r>\
+        <o id='1' tag='x'><v>a</v><v>b</v><n>note</n>own</o>\
+        <o id='2'/>\
+        <o id='3' tag='y'><v>c</v></o>\
+        <o/></r>";
+    let ex = Extract::parse(
+        "//o { id = @id ?; tag = @tag ?; vs = v/text() *; n = n ?; own = text() ?; all = . ? }",
+    )
+    .unwrap();
+    let recs: Vec<_> = ex.run_str(xml).map(|r| r.unwrap()).collect();
+    let j: Vec<_> = recs.iter().map(|r| r.to_json()).collect();
+    assert_eq!(j[0], r#"{"id":"1","tag":"x","vs":["a","b"],"n":"note","own":"own","all":"abnoteown"}"#);
+    assert_eq!(j[1], r#"{"id":"2","tag":null,"vs":[],"n":null,"own":null,"all":null}"#);
+    assert_eq!(j[2], r#"{"id":"3","tag":"y","vs":["c"],"n":null,"own":null,"all":"c"}"#);
+    assert_eq!(j[3], r#"{"id":null,"tag":null,"vs":[],"n":null,"own":null,"all":null}"#);
+}

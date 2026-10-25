@@ -1,6 +1,6 @@
 //! What `Extract` produces: records made of typed values.
 
-use std::{fmt, ops::Index};
+use std::{fmt, ops::Index, sync::Arc};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
@@ -152,8 +152,8 @@ impl fmt::Display for Value {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Record {
     pub(crate) rule: usize,
-    pub(crate) rule_name: Option<String>,
-    pub(crate) fields: Vec<(String, Value)>,
+    pub(crate) rule_name: Option<Arc<str>>,
+    pub(crate) fields: Vec<(Arc<str>, Value)>,
 }
 
 impl Record {
@@ -167,11 +167,11 @@ impl Record {
     }
 
     pub fn get(&self, field: &str) -> Option<&Value> {
-        self.fields.iter().find(|(k, _)| k == field).map(|(_, v)| v)
+        self.fields.iter().find(|(k, _)| &**k == field).map(|(_, v)| v)
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&str, &Value)> {
-        self.fields.iter().map(|(k, v)| (k.as_str(), v))
+        self.fields.iter().map(|(k, v)| (&**k, v))
     }
 
     pub fn len(&self) -> usize {

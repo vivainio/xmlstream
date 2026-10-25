@@ -77,23 +77,29 @@ xmlstream -e '//order { id = @id; skus = sku/text() * }' orders.xml   # NDJSON, 
 
 ## Performance
 
-Release build, one thread, on a 78 MB file of 400,000 orders (about 9.4 million
-events), read from disk. Peak memory was about 2 MB in every case.
+Release build, one thread, on a 78 MB file of 400,000 pretty-printed orders (about
+9.4 million events), read from disk. Peak memory was about 2 MB in every case.
 
 | What | Results | Time | Throughput |
 |---|---|---|---|
-| Parse events only (`Reader`) | 9.4 M events | 0.69 s | 118 MB/s |
-| `//order/@id` | 400,000 | 0.93 s | 88 MB/s |
-| `//order/sku/text()` | 1,000,563 | 1.04 s | 79 MB/s |
-| `//order` (build each element) | 400,000 | 1.26 s | 64 MB/s |
-| `Extract`, 2 fields | 400,000 records | 1.61 s | 51 MB/s |
-| `Extract`, 7 fields (lists, optional, constant) | 400,000 records | 2.33 s | 35 MB/s |
-| `Extract`, 3 rules with predicates | 408,000 records | 1.86 s | 44 MB/s |
+| quick-xml alone, no allocation (the floor) | 10.2 M events | 0.18 s | 450 MB/s |
+| `Reader::next_ref` (borrowed events) | 9.4 M events | 0.36 s | 225 MB/s |
+| `Reader` as an iterator (owned events) | 9.4 M events | 0.60 s | 136 MB/s |
+| `//order/@id` | 400,000 | 0.46 s | 178 MB/s |
+| `//order/sku/text()` | 1,000,563 | 0.51 s | 159 MB/s |
+| `//order` (build each element) | 400,000 | 0.77 s | 106 MB/s |
+| `Extract`, 2 fields | 400,000 records | 0.62 s | 132 MB/s |
+| `Extract`, 7 fields (list, optional, element, constant) | 400,000 records | 0.90 s | 91 MB/s |
+| `Extract`, 3 rules with predicates | 408,000 records | 0.73 s | 111 MB/s |
 
-Reproduce with `cargo run --release --example bench -- FILE MODE`. Throughput is
-bounded by the parser and by per-event allocation, not by file size; memory does not
-grow with the file.
+Reproduce with `cargo run --release --example bench -- FILE MODE`
+(`examples/floor.rs` is the quick-xml baseline). Memory does not grow with the file.
 
+What makes it fast: selectors and `Extract` read borrowed events from buffers the
+reader reuses, so steady-state parsing allocates nothing; per-record state and
+matchers are pooled and reused between records. If you write your own loop, prefer
+`Reader::next_ref()` over iterating when speed matters; iterating gives you owned
+`Event`s, which cost an allocation per string.
 
 ## What's in the box
 
@@ -241,7 +247,19 @@ For full XPath 1.0 or XSLT on files that fit in memory, use a DOM library.
 ## Working with events
 
 `Reader` is an iterator of `Event`s, and selectors run on events, so you can write
-your own loops and still use paths:
+your own loops and still use paths. For speed, `Reader::next_ref()` gives borrowed
+`EventRef`s with no per-event allocation (valid until the next call), and
+`Writer::write_event_ref` and `Matcher::feed_ref` accept them:
+
+```rust
+let mut r = Reader::new(file);
+let mut w = Writer::new(std::io::stdout());
+while let Some(ev) = r.next_ref()? {
+    w.write_event_ref(ev)?;               // copy a stream without allocating
+}
+```
+
+Owned events work too:
 
 ```rust
 // transform: copy a stream, dropping comments
