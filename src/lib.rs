@@ -13,15 +13,19 @@
 //! ```
 
 mod element;
+mod extract;
 mod error;
 mod path;
 mod reader;
 mod router;
+mod value;
 mod writer;
 
 pub use element::{Element, Node};
+pub use extract::{Card, Extract, ExtractBuilder, Records, Type};
 pub use error::{Error, Result};
 pub use path::{Hits, Limits, Match, Matcher, Overflow, Select, Selector, SelectorSet, StartTag};
 pub use reader::{Event, Options, Reader};
 pub use router::{Control, Flow, RouteBuilder, RouteId, Router, Stats, StreamItem, Take};
 pub use writer::Writer;
+pub use value::{Record, Value};

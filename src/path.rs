@@ -661,6 +661,20 @@ impl SelectorSet {
         Self::default()
     }
 
+    /// Adds an already parsed selector and returns its index.
+    pub(crate) fn add_selector(&mut self, sel: Selector) -> usize {
+        self.sels.push(sel);
+        self.sels.len() - 1
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.sels.len()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.sels.is_empty()
+    }
+
     fn from_selectors(sels: Vec<Selector>) -> Self {
         SelectorSet {
             sels,

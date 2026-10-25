@@ -6,17 +6,23 @@ use std::{
     process::ExitCode,
 };
 
-use xmlstream::{Match, Reader, Selector};
+use xmlstream::{Extract, Match, Reader, Selector};
 
 const USAGE: &str = "usage: xmlstream [--pretty] [--trim] PATH [FILE]\n\
-  e.g. xmlstream '//order[@status=\"open\"]/@id' orders.xml";
+       xmlstream [--trim] (-e RULES | -r RULES_FILE) [FILE]    (one JSON object per record)\n\
+  e.g. xmlstream '//order[@status=\"open\"]/@id' orders.xml\n\
+       xmlstream -e '//order { id = @id; skus = sku/text() * }' orders.xml";
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut pretty = false;
     let mut trim = false;
     let mut pos = Vec::new();
-    for a in std::env::args().skip(1) {
+    let mut rules: Option<String> = None;
+    let mut args = std::env::args().skip(1);
+    while let Some(a) = args.next() {
         match a.as_str() {
+            "-e" => rules = Some(args.next().ok_or(USAGE)?),
+            "-r" => rules = Some(std::fs::read_to_string(args.next().ok_or(USAGE)?)?),
             "--pretty" => pretty = true,
             "--trim" => trim = true,
             "-h" | "--help" => {
@@ -25,6 +31,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             _ => pos.push(a),
         }
+    }
+    if let Some(src) = rules {
+        let ex = Extract::parse(&src)?;
+        let input: Box<dyn io::Read> = match pos.as_slice() {
+            [] => Box::new(io::stdin().lock()),
+            [f] => Box::new(File::open(f)?),
+            _ => return Err(USAGE.into()),
+        };
+        let mut out = BufWriter::new(io::stdout().lock());
+        for rec in ex.run(Reader::new(input).trim(trim)) {
+            writeln!(out, "{}", rec?.to_json_tagged())?;
+        }
+        out.flush()?;
+        return Ok(());
     }
     let (path, file) = match pos.as_slice() {
         [p] => (p, None),

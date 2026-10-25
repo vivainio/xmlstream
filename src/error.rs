@@ -8,6 +8,8 @@ pub enum Error {
     Path(String),
     /// The writer was asked to emit something that would not be well-formed.
     Write(String),
+    /// A record could not be filled in (see `Extract`).
+    Extract(String),
     /// A memory budget was exceeded (see `Limits`).
     Limit(String),
     /// An error raised by a user callback.
@@ -23,6 +25,7 @@ impl fmt::Display for Error {
             Error::Xml(m) => write!(f, "xml: {m}"),
             Error::Path(m) => write!(f, "path: {m}"),
             Error::Write(m) => write!(f, "write: {m}"),
+            Error::Extract(m) => write!(f, "extract: {m}"),
             Error::Limit(m) => write!(f, "limit: {m}"),
             Error::Other(e) => write!(f, "{e}"),
             Error::Io(e) => write!(f, "io: {e}"),

@@ -15,6 +15,45 @@ for m in sel.select_str(xml) {
 }
 ```
 
+Pulling fields out of records, with no callbacks:
+
+```rust
+use xmlstream::{Extract, Reader};
+
+let ex = Extract::parse(r#"
+    open = //order[@status='open'] {
+        id    = @id
+        total = total/text() as number
+        skus  = sku/text() *            # * zero or more, + one or more, ? optional
+        kind  = "order"                 # a quoted value is a constant
+    }
+    refund = //refund {
+        id = @id; amount = amount/text() as number; kind = "refund"
+    }
+"#)?;
+
+for rec in ex.run(Reader::new(file)) {
+    let rec = rec?;                              // one Record per matched element
+    println!("{:?} {} {}", rec.rule_name(), rec["id"], rec["kind"]);
+    // rec.to_json() -> {"id":"1","total":9.5,"skus":["a","b"],"kind":"order"}
+}
+```
+
+The same rules in Rust, if you prefer a builder:
+
+```rust
+let ex = Extract::new()
+    .rule("//order[@status='open']").name("open")
+        .field("id", "@id")
+        .field("total", "total/text()").number()
+        .field("skus", "sku/text()").many()
+        .constant("kind", "order")
+    .rule("//refund").name("refund")
+        .field("id", "@id")
+        .constant("kind", "refund")
+    .build()?;
+```
+
 Streaming a file:
 
 ```rust
@@ -33,6 +72,7 @@ for m in Selector::parse("//order")?.select(Reader::new(file)) {
 cargo install --path .
 xmlstream '//order[@status="open"]/@id' orders.xml
 xmlstream --pretty '//order[2]' < orders.xml
+xmlstream -e '//order { id = @id; skus = sku/text() * }' orders.xml   # NDJSON, one record per line
 ```
 
 On a 1M-element, 43 MB file, finding one element takes about 0.7 s and 2 MB of memory.
@@ -48,6 +88,38 @@ On a 1M-element, 43 MB file, finding one element takes about 0.7 s and 2 MB of m
   enforces well-formedness (balanced tags, one root), so it cannot emit a
   broken document. `write_event` pipes reader events straight into it for
   streaming transforms.
+
+## Extracting records
+
+`Extract` is the easy way to get data out. A **rule** says which elements are
+records and which **fields** to take from each; you get one `Record` per element.
+One run can hold many rules, so a single pass over the file can pull several kinds
+of record, and every record knows its rule (`rule_name()`, `rule_index()`).
+
+- **Fields** are written `name = path`, separated by a newline or `;`. Paths are
+  relative to the record: `sku` is a child, `//sku` any descendant, `@id` the
+  record's own attribute, `text()` its own text, `.` all its text.
+- **Types**: `as text` (default), `int`, `number`, `bool`. A value that doesn't
+  parse is an error that names the rule, field and value.
+- **How many**: no marker is exactly one (missing is an error), `?` optional
+  (`Value::Null`), `*` a list of zero or more, `+` a list of one or more. If a
+  one-valued field matches several times, the first wins.
+- **Constants**: a quoted value (`kind = "refund"`), or `.constant("kind", ..)` in
+  the builder, puts a fixed value in every record of that rule. Useful to tell
+  rules apart in downstream code. `"5" as int` makes it a typed constant.
+- **Memory**: fields are filled while the element streams past, and only those
+  values are kept, not the subtree. Paths ending in `@attr` or `text()` buffer
+  nothing, so a record with 200,000 children costs only the fields you asked for.
+  A field that selects an element (`note`) keeps that element's text, so it does
+  buffer that element.
+- `Record` has `get`, `rec["name"]` (a missing field reads as `Null`), `iter`,
+  `to_json()` and `to_json_tagged()` (adds `"_rule"` for named rules).
+- A record's path follows the same rule as streaming: no child-content predicates
+  (`//order[sku='a']`). Put the condition in your code, or select the field.
+- Rules in text have `#` comments. Mistakes are reported with the line number.
+
+When rules aren't enough (switching logic mid-parse, event-level streaming),
+drop down to the selectors and `Router` below.
 
 ## Selector syntax
 

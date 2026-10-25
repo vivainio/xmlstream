@@ -98,7 +98,7 @@ fn boxed_gate<'a, T: Into<Take>>(
 }
 
 /// A route that streams cannot also depend on content it has not read yet.
-fn check_stream(sel: &Selector) -> Result<()> {
+pub(crate) fn check_stream(sel: &Selector) -> Result<()> {
     if !sel.yields_elements() {
         return Err(Error::Path(format!(
             "{:?}: only element paths can be streamed (not @attr or text())",
