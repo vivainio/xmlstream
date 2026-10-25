@@ -118,8 +118,7 @@ of record, and every record knows its rule (`rule_name()`, `rule_index()`).
   (`//order[sku='a']`). Put the condition in your code, or select the field.
 - Rules in text have `#` comments. Mistakes are reported with the line number.
 
-When rules aren't enough (switching logic mid-parse, event-level streaming),
-drop down to the selectors and `Router` below.
+When rules aren't enough, drop down to the selectors below, or to events.
 
 ## Selector syntax
 
@@ -184,140 +183,29 @@ for m in Selector::parse("//order")?.select(Reader::new(file)) {
 }
 ```
 
-## Memory control and callbacks
+### Memory budget
 
-`Router` runs several selectors over **one** forward pass and calls your closures.
-Each route has an optional **gate**, which sees the start tag before anything is
-buffered, and a **handler**, which gets the finished match.
+Matches that are elements (`//order`) and candidates held for a content predicate
+are buffered. Cap that with `Limits`; it is off by default:
 
 ```rust
-use xmlstream::{Flow, Limits, Overflow, Reader, Router};
+use xmlstream::{Limits, Overflow, Reader, Selector};
 
-let mut router = Router::new().limits(Limits {
+let limits = Limits {
     max_element_bytes: 64 * 1024,   // biggest single candidate
-    max_total_bytes: 1 << 20,       // all candidates buffered at once
+    max_total_bytes: 1 << 20,       // all candidates held at once
     on_overflow: Overflow::Skip,    // or Overflow::Error (the default)
-});
-
-router.on_gated(
-    "//order[sku='a']",
-    |tag, _| tag.attr("region") == Some("eu"),   // decided from the tag alone: no buffering if false
-    |m, _| { handle(m.into_element().unwrap()); Ok(Flow::Continue) },
-)?;
-router.on("//audit/@user", |m, _| { log(m.to_text()); Ok(Flow::Continue) })?;
-
-let stats = router.run(Reader::new(file))?;   // one pass; stats.skipped = dropped candidates
+};
+for m in Selector::parse("//order")?.select_with(Reader::new(file), limits) {
+    // an order bigger than 64 KB is dropped instead of buffered
+}
 ```
 
-- **Many routes, one pass.** Every selector is advanced by the same event, so the
-  input is read once, front to back, however many routes there are. Nothing is
-  re-read. A test counts the bytes pulled from the source and checks it equals the
-  document size with three routes registered.
-- **Budgets are shared.** `max_total_bytes` covers candidates from all routes at
-  the same moment. Bytes are released as soon as a candidate is handed to its
-  handler or rejected. Sizes count names, attributes and text; real heap use is
-  a small multiple of that.
-- **Overflow.** `Error` stops with `Error::Limit`. `Skip` drops the largest
-  offender and carries on, and `Stats::skipped` says how many were lost.
-- **Gate first.** Prefer a gate when the tag already tells you the answer; the
-  candidate then costs nothing. A gate only affects its own route.
-- **Handlers run in event order**, as matches complete (element matches at the
-  closing tag, attribute matches at the start tag). A handler error ends the run.
-- **`Flow::Stop` ends the whole run**, for every route. Nothing more is parsed.
-
-### Streaming a subtree instead of buffering it
-
-For an element too big to build, the gate can answer `Take::Stream`. Nothing is
-buffered; the route's stream callback gets every event of the subtree as it is
-parsed, and can feed them to a `Matcher` (selectors) or a `Writer` (copy or
-transform).
-
-```rust
-use xmlstream::{Flow, Reader, Router, Selector, Take};
-
-let skus = Selector::parse("item/@sku")?;
-let mut matcher = None;
-let mut router = Router::new();
-router.on_split(
-    "/r/*",
-    |tag, _| if tag.name == "big" { Take::Stream } else { Take::Buffer },
-    |m, _| { small(m.into_element().unwrap()); Ok(Flow::Continue) },   // buffered
-    |item, _| {                                                        // streamed
-        if item.is_first() { matcher = Some(skus.matcher()); }
-        for (_, hit) in matcher.as_mut().unwrap().feed(item.event)? {
-            record(hit.to_text());
-        }
-        Ok(Flow::Continue)
-    },
-)?;
-router.run(Reader::new(file))?;
-```
-
-- A gate returns a `Take` (`Buffer`, `Stream` or `Skip`); a plain `bool` still
-  works (`true` is `Buffer`).
-- `on_stream(path, cb)` always streams, `on_stream_gated` streams what the gate
-  picks, and `on_split` lets the gate choose per candidate between a handler and
-  a stream callback.
-- Each `StreamItem` has the `event` and its `depth` relative to the matched
-  element (0 for its own start and end tags). `is_first()` and `is_last()` mark
-  the two ends, so you know when to reset per-element state.
-- A `Matcher` fed the events treats the streamed element as the document root, so
-  `item/@sku` means that element's `item` children. `Matcher::feed` returns the
-  matches each event completes. Streaming costs no budget; only what you collect
-  yourself uses memory.
-- Only element paths can be streamed, and not ones with child-content predicates
-  (`[sku='a']`), since those need the content before they can decide. Registering
-  such a route is an error.
-- Outside a router, `Selector::select_events(iter)` runs a selector over any
-  iterator of `Event`s, and `Selector::matcher()` is the push equivalent.
-
-### Switching logic while parsing
-
-Every gate and handler also receives a `Control`, which changes the set of routes
-while the parse carries on. It is a state machine driven by the document:
-
-```rust
-use std::{cell::RefCell, rc::Rc};
-
-let vats = Rc::new(RefCell::new(Vec::new()));
-let mut router = Router::new();
-let v = vats.clone();
-router.on("//order/@type", move |m, ctl| {
-    if m.to_text() == "eu" {
-        let v = v.clone();
-        // watch <vat> only inside this order; the route removes itself when the order closes
-        ctl.route("vat/text()").scoped().on(move |m, _| {
-            v.borrow_mut().push(m.to_text());
-            Ok(Flow::Continue)
-        })?;
-    }
-    Ok(Flow::Continue)
-})?;
-router.run(Reader::new(file))?;
-```
-
-- `ctl.route(path)` starts a new route. Add `.gate(..)` for a start-tag gate and
-  `.on(handler)` to finish. It returns a `RouteId`.
-- **Unscoped** (the default): the route applies to everything that follows in the
-  document. Its first step is tried on every element that opens from now on, so
-  `vat` and `//vat` both find a `vat` at any depth. Positions (`[2]`) count only
-  siblings seen after it was added.
-- **`.scoped()`**: the route is anchored to the element that is open when it is
-  added, and removed when that element closes. From a gate that is the element
-  whose start tag matched, so `vat` means its child and `//vat` any descendant.
-  From a handler for an element match (which fires at the closing tag) it is the
-  parent.
-- `ctl.remove(id)` and `ctl.remove_this()` switch a route off; anything it was
-  still buffering is dropped. `ctl.this_route()` gives the current route's id.
-- Changes apply from the next event on, so a route added by a gate sees the
-  children of the element the gate looked at, and the stream is never rewound.
-- Added routes share the router's memory budget.
-- A route added from a callback outlives that call, so its closure cannot borrow
-  the callback's variables. Share state with `Rc<RefCell<..>>`, or move owned
-  values in.
-
-The same budget works without a router: `Selector::select_with(reader, limits)`
-and `SelectorSet::limits(limits)`.
+`Error` stops with `Error::Limit`; `Skip` drops the largest offender and carries
+on. Sizes count names, attributes and text; real heap use is a small multiple.
+The same limits work for `SelectorSet::limits(..)` and `Matcher`. Prefer paths that
+end in `@attr` or `text()`, or an `Extract` rule, when you don't need the whole
+subtree: they buffer nothing.
 
 ### Other limits
 
@@ -331,6 +219,32 @@ and `SelectorSet::limits(limits)`.
 - No validation: no XSD, no DTD, no entity expansion.
 
 For full XPath 1.0 or XSLT on files that fit in memory, use a DOM library.
+
+## Working with events
+
+`Reader` is an iterator of `Event`s, and selectors run on events, so you can write
+your own loops and still use paths:
+
+```rust
+// transform: copy a stream, dropping comments
+let mut out = Writer::new(std::io::stdout()).indent(2);
+for ev in Reader::new(file) {
+    let ev = ev?;
+    if !matches!(ev, Event::Comment(_)) { out.write_event(&ev)?; }
+}
+
+// push: feed a selector events as they arrive from somewhere else
+let mut m = Selector::parse("item/@sku")?.matcher();
+for ev in events {
+    for (_, hit) in m.feed(&ev)? { println!("{}", hit.to_text()); }
+}
+
+// pull: run a selector over any iterator of events
+let n = Selector::parse("//order")?.select_events(events.into_iter().map(Ok)).count();
+```
+
+`Matcher::feed` treats the first element it sees as the document root, so feeding
+the events of one subtree makes paths relative to it.
 
 ## How it compares
 

@@ -50,9 +50,25 @@ use crate::{
     error::{Error, Result},
     path::{Engine, Limits, Matcher, Selector, SelectorSet},
     reader::{Event, Reader},
-    router::check_stream,
     value::{Record, Value},
 };
+
+/// Records are filled while they stream past, so a rule cannot depend on content not read yet.
+fn check_stream(sel: &Selector) -> Result<()> {
+    if !sel.yields_elements() {
+        return Err(Error::Path(format!(
+            "{:?}: a rule's path must select elements (not @attr or text())",
+            sel.as_str()
+        )));
+    }
+    if sel.needs_buffering() {
+        return Err(Error::Path(format!(
+            "{:?}: a rule's path cannot use child-content predicates; they would need the whole element buffered",
+            sel.as_str()
+        )));
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Type {
@@ -331,8 +347,8 @@ impl<R: Read> Records<'_, R> {
         };
         let mut starting = Vec::new();
         self.engine
-            .feed(&ev, &mut VecDeque::new(), &mut |si, tag| {
-                starting.push((si, tag.attrs.to_vec()));
+            .feed(&ev, &mut VecDeque::new(), &mut |si, attrs| {
+                starting.push((si, attrs.to_vec()));
                 false // never buffer: the fields are collected as events pass
             })?;
         for (si, attrs) in starting {
