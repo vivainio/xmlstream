@@ -87,7 +87,13 @@ For full XPath 1.0 or XSLT on files that fit in memory, use a DOM library.
 | StAX / pull (quick-xml, xml-rs) | tiny | a hand-built loop | when you need every event |
 | **xmlstream** | one matched subtree | a query | huge files, selected records |
 
-Built on [quick-xml](https://crates.io/crates/quick-xml).
+## Built on quick-xml
+
+xmlstream does not reinvent XML syntax. Tokenizing, tag matching, attribute
+parsing and entity decoding are all done by [quick-xml](https://crates.io/crates/quick-xml),
+a mature and fast parser. xmlstream adds the layer above it: bounded-memory
+limits, merged text runs, the selector engine, owned subtrees for matches and
+a strict writer.
 
 ## License
 
