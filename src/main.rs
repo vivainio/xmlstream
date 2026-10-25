@@ -40,7 +40,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     for m in sel.select(Reader::new(input).trim(trim || pretty)) {
         match m? {
             Match::Element(e) => {
-                let s = if pretty { e.to_xml_pretty(2)? } else { e.to_xml()? };
+                let s = if pretty {
+                    e.to_xml_pretty(2)?
+                } else {
+                    e.to_xml()?
+                };
                 out.write_all(s.trim_end().as_bytes())?;
             }
             Match::Attr(s) | Match::Text(s) => out.write_all(s.as_bytes())?,

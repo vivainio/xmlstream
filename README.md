@@ -112,6 +112,50 @@ for m in Selector::parse("//order")?.select(Reader::new(file)) {
 }
 ```
 
+## Memory control and callbacks
+
+`Router` runs several selectors over **one** forward pass and calls your closures.
+Each route has an optional **gate**, which sees the start tag before anything is
+buffered, and a **handler**, which gets the finished match.
+
+```rust
+use xmlstream::{Flow, Limits, Overflow, Reader, Router};
+
+let mut router = Router::new().limits(Limits {
+    max_element_bytes: 64 * 1024,   // biggest single candidate
+    max_total_bytes: 1 << 20,       // all candidates buffered at once
+    on_overflow: Overflow::Skip,    // or Overflow::Error (the default)
+});
+
+router.on_gated(
+    "//order[sku='a']",
+    |tag| tag.attr("region") == Some("eu"),   // decided from the tag alone: no buffering if false
+    |m| { handle(m.into_element().unwrap()); Ok(Flow::Continue) },
+)?;
+router.on("//audit/@user", |m| { log(m.to_text()); Ok(Flow::Continue) })?;
+
+let stats = router.run(Reader::new(file))?;   // one pass; stats.skipped = dropped candidates
+```
+
+- **Many routes, one pass.** Every selector is advanced by the same event, so the
+  input is read once, front to back, however many routes there are. Nothing is
+  re-read. A test counts the bytes pulled from the source and checks it equals the
+  document size with three routes registered.
+- **Budgets are shared.** `max_total_bytes` covers candidates from all routes at
+  the same moment. Bytes are released as soon as a candidate is handed to its
+  handler or rejected. Sizes count names, attributes and text; real heap use is
+  a small multiple of that.
+- **Overflow.** `Error` stops with `Error::Limit`. `Skip` drops the largest
+  offender and carries on, and `Stats::skipped` says how many were lost.
+- **Gate first.** Prefer a gate when the tag already tells you the answer; the
+  candidate then costs nothing. A gate only affects its own route.
+- **Handlers run in event order**, as matches complete (element matches at the
+  closing tag, attribute matches at the start tag). A handler error ends the run.
+- **`Flow::Stop` ends the whole run**, for every route. Nothing more is parsed.
+
+The same budget works without a router: `Selector::select_with(reader, limits)`
+and `SelectorSet::limits(limits)`.
+
 ### Other limits
 
 - Element matches arrive when the element closes, so with nested matches

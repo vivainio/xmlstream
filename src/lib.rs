@@ -16,10 +16,12 @@ mod element;
 mod error;
 mod path;
 mod reader;
+mod router;
 mod writer;
 
 pub use element::{Element, Node};
 pub use error::{Error, Result};
-pub use path::{Hits, Match, Select, Selector, SelectorSet};
+pub use path::{Hits, Limits, Match, Overflow, Select, Selector, SelectorSet, StartTag};
 pub use reader::{Event, Options, Reader};
+pub use router::{Flow, Router, Stats};
 pub use writer::Writer;

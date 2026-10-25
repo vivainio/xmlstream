@@ -98,9 +98,15 @@ enum Cond {
 #[derive(Debug, Clone, PartialEq)]
 enum Pred {
     Pos(usize),
-    Attr { name: String, cond: Cond },
+    Attr {
+        name: String,
+        cond: Cond,
+    },
     /// Looks at the element's content, so it is decided when the element closes.
-    Child { path: Selector, cond: Cond },
+    Child {
+        path: Selector,
+        cond: Cond,
+    },
 }
 
 impl Cond {
@@ -138,6 +144,61 @@ enum Output {
     Text,
 }
 
+/// What to do with a candidate that does not fit the memory budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Overflow {
+    /// Stop with `Error::Limit`.
+    #[default]
+    Error,
+    /// Drop that candidate (the largest one first) and carry on.
+    Skip,
+}
+
+/// Memory budget for buffered candidates. Sizes count the bytes of names, attribute
+/// keys and values, and text; the real heap use is a small multiple of that.
+#[derive(Debug, Clone, Copy)]
+pub struct Limits {
+    /// Largest single candidate subtree.
+    pub max_element_bytes: usize,
+    /// All candidates being buffered at one moment, added together.
+    pub max_total_bytes: usize,
+    pub on_overflow: Overflow,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Limits {
+            max_element_bytes: usize::MAX,
+            max_total_bytes: usize::MAX,
+            on_overflow: Overflow::Error,
+        }
+    }
+}
+
+/// A start tag that matched a selector, shown to a gate before anything is buffered.
+#[derive(Debug, Clone, Copy)]
+pub struct StartTag<'a> {
+    pub name: &'a str,
+    pub attrs: &'a [(String, String)],
+    /// Number of open ancestors; the root element has depth 0.
+    pub depth: usize,
+}
+
+impl StartTag<'_> {
+    pub fn attr(&self, name: &str) -> Option<&str> {
+        self.attrs
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    }
+}
+
+pub(crate) type Gate<'g> = &'g mut dyn FnMut(usize, &StartTag) -> bool;
+
+fn elem_size(name: &str, attrs: &[(String, String)]) -> usize {
+    name.len() + attrs.iter().map(|(k, v)| k.len() + v.len()).sum::<usize>()
+}
+
 /// `pattern` may be a local name or a qualified name; `actual` is the qualified name in the document.
 pub(crate) fn name_matches(pattern: &str, actual: &str) -> bool {
     if pattern.contains(':') {
@@ -157,14 +218,22 @@ impl Test {
 }
 
 impl Step {
-    fn matches(&self, name: &str, attrs: &[(String, String)], pos: impl Fn(&Test) -> usize) -> bool {
+    fn matches(
+        &self,
+        name: &str,
+        attrs: &[(String, String)],
+        pos: impl Fn(&Test) -> usize,
+    ) -> bool {
         if !self.test.matches(name) {
             return false;
         }
         self.preds.iter().all(|p| match p {
             Pred::Pos(n) => pos(&self.test) == *n,
             Pred::Attr { name, cond } => {
-                let v = attrs.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str());
+                let v = attrs
+                    .iter()
+                    .find(|(k, _)| k == name)
+                    .map(|(_, v)| v.as_str());
                 match (cond, v) {
                     (Cond::Exists, v) => v.is_some(),
                     (c, v) => v.is_some_and(|v| c.holds(v)),
@@ -493,7 +562,16 @@ impl Selector {
 
     /// Streams matches out of `reader` one at a time.
     pub fn select<R: Read>(&self, reader: Reader<R>) -> Select<R> {
-        Select(SelectorSet::from_selectors(vec![self.clone()]).select(reader))
+        self.select_with(reader, Limits::default())
+    }
+
+    /// Like `select`, with a memory budget for buffered candidates.
+    pub fn select_with<R: Read>(&self, reader: Reader<R>, limits: Limits) -> Select<R> {
+        Select(
+            SelectorSet::from_selectors(vec![self.clone()])
+                .limits(limits)
+                .select(reader),
+        )
     }
 
     pub fn select_str<'a>(&self, xml: &'a str) -> Select<std::io::Cursor<&'a [u8]>> {
@@ -502,9 +580,11 @@ impl Selector {
 
     /// Runs against the children of `e`, so `e` itself plays the document node.
     fn select_children(&self, e: &Element) -> Vec<Match> {
-        let mut engine = Engine::new(vec![self.clone()]);
+        let mut engine = Engine::new(vec![self.clone()], Limits::default());
         let mut out = VecDeque::new();
-        let mut feed = |ev: Event| engine.feed(&ev, &mut out);
+        let mut feed = |ev: Event| {
+            let _ = engine.feed(&ev, &mut out, &mut allow_all);
+        };
         for n in &e.children {
             match n {
                 Node::Element(c) => c.for_each_event(&mut feed),
@@ -517,9 +597,11 @@ impl Selector {
     }
 
     pub(crate) fn select_element(&self, e: &Element) -> Result<Vec<Match>> {
-        let mut engine = Engine::new(vec![self.clone()]);
+        let mut engine = Engine::new(vec![self.clone()], Limits::default());
         let mut out = VecDeque::new();
-        e.for_each_event(&mut |ev| engine.feed(&ev, &mut out));
+        e.for_each_event(&mut |ev| {
+            let _ = engine.feed(&ev, &mut out, &mut allow_all);
+        });
         Ok(out.into_iter().map(|(_, m)| m).collect())
     }
 }
@@ -528,6 +610,7 @@ impl Selector {
 #[derive(Debug, Clone, Default)]
 pub struct SelectorSet {
     sels: Vec<Selector>,
+    limits: Limits,
 }
 
 impl SelectorSet {
@@ -536,7 +619,15 @@ impl SelectorSet {
     }
 
     fn from_selectors(sels: Vec<Selector>) -> Self {
-        SelectorSet { sels }
+        SelectorSet {
+            sels,
+            limits: Limits::default(),
+        }
+    }
+
+    pub fn limits(mut self, limits: Limits) -> Self {
+        self.limits = limits;
+        self
     }
 
     /// Adds a selector and returns the index hits will carry.
@@ -548,11 +639,15 @@ impl SelectorSet {
     pub fn select<R: Read>(&self, reader: Reader<R>) -> Hits<R> {
         Hits {
             reader,
-            engine: Engine::new(self.sels.clone()),
+            engine: Engine::new(self.sels.clone(), self.limits),
             queue: VecDeque::new(),
             failed: false,
         }
     }
+}
+
+fn allow_all(_: usize, _: &StartTag) -> bool {
+    true
 }
 
 /// Iterator of `(selector index, match)`.
@@ -575,7 +670,12 @@ impl<R: Read> Iterator for Hits<R> {
                 return None;
             }
             match self.reader.next_event() {
-                Ok(Some(ev)) => self.engine.feed(&ev, &mut self.queue),
+                Ok(Some(ev)) => {
+                    if let Err(e) = self.engine.feed(&ev, &mut self.queue, &mut allow_all) {
+                        self.failed = true;
+                        return Some(Err(e));
+                    }
+                }
                 Ok(None) => return None,
                 Err(e) => {
                     self.failed = true;
@@ -607,7 +707,9 @@ struct Frame {
 enum CapKind {
     /// Collects the whole subtree. With `deferred`, the element is a candidate for the step at
     /// that index and is only reported (or searched further) if its child predicates hold.
-    Full { deferred: Option<usize> },
+    Full {
+        deferred: Option<usize>,
+    },
     Text,
 }
 
@@ -618,20 +720,27 @@ struct Capture {
     level: usize,
     stack: Vec<Element>,
     text: String,
+    /// Size charged against the budget so far.
+    bytes: usize,
 }
 
-struct Engine {
+pub(crate) struct Engine {
     sels: Vec<Selector>,
     frames: Vec<Frame>,
     caps: Vec<Capture>,
     needs_pos: bool,
+    limits: Limits,
+    total: usize,
+    pub(crate) skipped: u64,
 }
 
 impl Engine {
-    fn new(sels: Vec<Selector>) -> Self {
-        let needs_pos = sels
-            .iter()
-            .any(|s| s.steps.iter().any(|st| st.preds.iter().any(|p| matches!(p, Pred::Pos(_)))));
+    pub(crate) fn new(sels: Vec<Selector>, limits: Limits) -> Self {
+        let needs_pos = sels.iter().any(|s| {
+            s.steps
+                .iter()
+                .any(|st| st.preds.iter().any(|p| matches!(p, Pred::Pos(_))))
+        });
         let root = Frame {
             states: vec![vec![0]; sels.len()],
             counts: Vec::new(),
@@ -641,16 +750,25 @@ impl Engine {
             frames: vec![root],
             caps: Vec::new(),
             needs_pos,
+            limits,
+            total: 0,
+            skipped: 0,
         }
     }
 
-    fn feed(&mut self, ev: &Event, out: &mut VecDeque<(usize, Match)>) {
+    pub(crate) fn feed(
+        &mut self,
+        ev: &Event,
+        out: &mut VecDeque<(usize, Match)>,
+        gate: Gate,
+    ) -> Result<()> {
         match ev {
-            Event::Start { name, attrs } => self.start(name, attrs, out),
+            Event::Start { name, attrs } => self.start(name, attrs, out, gate)?,
             Event::End { .. } => self.end(out),
             Event::Text(t) | Event::CData(t) => {
                 let cdata = matches!(ev, Event::CData(_));
                 let level = self.frames.len();
+                let mut added = 0;
                 for c in &mut self.caps {
                     match c.kind {
                         CapKind::Full { .. } => {
@@ -660,23 +778,78 @@ impl Engine {
                                 Node::Text(t.clone())
                             };
                             c.stack.last_mut().unwrap().children.push(n);
+                            c.bytes += t.len();
+                            added += t.len();
                         }
-                        CapKind::Text if c.level == level => c.text.push_str(t),
+                        CapKind::Text if c.level == level => {
+                            c.text.push_str(t);
+                            c.bytes += t.len();
+                            added += t.len();
+                        }
                         CapKind::Text => {}
                     }
                 }
+                self.total += added;
+                self.enforce()?;
             }
             Event::Comment(t) => {
+                let mut added = 0;
                 for c in &mut self.caps {
                     if let CapKind::Full { .. } = c.kind {
-                        c.stack.last_mut().unwrap().children.push(Node::Comment(t.clone()));
+                        c.stack
+                            .last_mut()
+                            .unwrap()
+                            .children
+                            .push(Node::Comment(t.clone()));
+                        c.bytes += t.len();
+                        added += t.len();
                     }
+                }
+                self.total += added;
+                self.enforce()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Applies the memory budget: fails, or drops the largest offending candidate.
+    fn enforce(&mut self) -> Result<()> {
+        loop {
+            let over = self
+                .caps
+                .iter()
+                .position(|c| c.bytes > self.limits.max_element_bytes)
+                .or_else(|| {
+                    if self.total > self.limits.max_total_bytes {
+                        (0..self.caps.len()).max_by_key(|&i| self.caps[i].bytes)
+                    } else {
+                        None
+                    }
+                });
+            let Some(i) = over else { return Ok(()) };
+            match self.limits.on_overflow {
+                Overflow::Error => {
+                    return Err(Error::Limit(format!(
+                        "candidate element exceeds the memory budget ({} bytes buffered, {} in the largest)",
+                        self.total, self.caps[i].bytes
+                    )))
+                }
+                Overflow::Skip => {
+                    let c = self.caps.remove(i);
+                    self.total = self.total.saturating_sub(c.bytes);
+                    self.skipped += 1;
                 }
             }
         }
     }
 
-    fn start(&mut self, name: &str, attrs: &[(String, String)], out: &mut VecDeque<(usize, Match)>) {
+    fn start(
+        &mut self,
+        name: &str,
+        attrs: &[(String, String)],
+        out: &mut VecDeque<(usize, Match)>,
+        gate: Gate,
+    ) -> Result<()> {
         let needs_pos = self.needs_pos;
         let parent = self.frames.last_mut().unwrap();
         if needs_pos {
@@ -719,17 +892,29 @@ impl Engine {
             next_states.push(ns);
         }
 
+        let size = elem_size(name, attrs);
         for c in &mut self.caps {
             if let CapKind::Full { .. } = c.kind {
                 c.stack.push(Element::with_attrs(name, attrs.to_vec()));
+                c.bytes += size;
+                self.total += size;
             }
         }
+        let tag = StartTag {
+            name,
+            attrs,
+            depth: self.frames.len() - 1,
+        };
         self.frames.push(Frame {
             states: next_states,
             counts: Vec::new(),
         });
         let level = self.frames.len();
         for (si, step) in candidates {
+            if !gate(si, &tag) {
+                continue;
+            }
+            self.total += size;
             self.caps.push(Capture {
                 sel: si,
                 kind: CapKind::Full {
@@ -738,31 +923,41 @@ impl Engine {
                 level,
                 stack: vec![Element::with_attrs(name, attrs.to_vec())],
                 text: String::new(),
+                bytes: size,
             });
         }
         for si in hits {
+            if !gate(si, &tag) {
+                continue;
+            }
             match &self.sels[si].output {
                 Output::Attr(a) => {
                     if let Some((_, v)) = attrs.iter().find(|(k, _)| k == a) {
                         out.push_back((si, Match::Attr(v.clone())));
                     }
                 }
-                Output::Element => self.caps.push(Capture {
-                    sel: si,
-                    kind: CapKind::Full { deferred: None },
-                    level,
-                    stack: vec![Element::with_attrs(name, attrs.to_vec())],
-                    text: String::new(),
-                }),
+                Output::Element => {
+                    self.total += size;
+                    self.caps.push(Capture {
+                        sel: si,
+                        kind: CapKind::Full { deferred: None },
+                        level,
+                        stack: vec![Element::with_attrs(name, attrs.to_vec())],
+                        text: String::new(),
+                        bytes: size,
+                    })
+                }
                 Output::Text => self.caps.push(Capture {
                     sel: si,
                     kind: CapKind::Text,
                     level,
                     stack: Vec::new(),
                     text: String::new(),
+                    bytes: 0,
                 }),
             }
         }
+        self.enforce()
     }
 
     fn end(&mut self, out: &mut VecDeque<(usize, Match)>) {
@@ -777,13 +972,17 @@ impl Engine {
                             parent.children.push(Node::Element(el));
                             keep.push(c);
                         }
-                        None => match deferred {
-                            None => out.push_back((c.sel, Match::Element(el))),
-                            Some(i) => finish_deferred(&self.sels[c.sel], c.sel, i, el, out),
-                        },
+                        None => {
+                            self.total = self.total.saturating_sub(c.bytes);
+                            match deferred {
+                                None => out.push_back((c.sel, Match::Element(el))),
+                                Some(i) => finish_deferred(&self.sels[c.sel], c.sel, i, el, out),
+                            }
+                        }
                     }
                 }
                 CapKind::Text if c.level == level => {
+                    self.total = self.total.saturating_sub(c.bytes);
                     if !c.text.is_empty() {
                         out.push_back((c.sel, Match::Text(c.text)));
                     }
