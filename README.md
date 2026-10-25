@@ -121,7 +121,7 @@ One run can hold many rules, so a single pass over the file can pull several kin
 of record, and every record knows its rule (`rule_name()`, `rule_index()`).
 
 - **Fields** are written `name = path`, separated by a newline or `;`. Paths are
-  relative to the record: `sku` is a child, `//sku` any descendant, `@id` the
+  relative to the record: `sku` and `./sku` are children, `//sku` and `.//sku` any descendant, `@id` the
   record's own attribute, `text()` its own text, `.` all its text.
 - **Types**: `as text` (default), `int`, `number`, `bool`. A value that doesn't
   parse is an error that names the rule, field and value.
@@ -143,6 +143,37 @@ of record, and every record knows its rule (`rule_name()`, `rule_index()`).
 - Rules in text have `#` comments. Mistakes are reported with the line number.
 
 When rules aren't enough, drop down to the selectors below, or to events.
+
+### "Find each `//order`, then select `./foo` inside it"
+
+That is exactly what a rule is: the rule path finds each `//order`, and each field
+is a path evaluated from that order, with the same spelling you'd use in XPath:
+
+| In XPath, from an order | As a field |
+|---|---|
+| `./@id`, `@id` | `id = @id` |
+| `./foo/text()` | `foo = ./foo/text()` (or `foo/text()`) |
+| `./foo` (string value) | `foo = ./foo` |
+| `.//foo` | `foo = .//foo/text() *` |
+| `./items/item/sku` | `skus = ./items/item/sku/text() *` |
+| `./foo[@k='x']/bar` | `bar = ./foo[@k='x']/bar/text()` |
+| `./foo[./bar]` | `has = ./foo[./bar] ?` |
+| `string(.)` | `all = .` |
+
+In Rust code, the same relative paths work on a matched element:
+
+```rust
+for m in Selector::parse("//order")?.select(Reader::new(file)) {
+    let order = m?.into_element().unwrap();
+    let foos = order.select_str("./foo/text()")?;     // children
+    let deep = order.select_str(".//foo/text()")?;    // any depth
+    let id   = order.select_str("@id")?;              // its own attribute
+}
+```
+
+Prefer a rule when you only need some fields: the fields are collected while the
+order streams past and the order itself is never built. Use the loop when you need
+the whole subtree.
 
 ## Selector syntax
 

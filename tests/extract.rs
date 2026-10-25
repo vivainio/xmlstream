@@ -380,3 +380,27 @@ fn borrowed_events_feed_writer_without_owning() {
     }
     assert_eq!(String::from_utf8(w.finish().unwrap()).unwrap(), xml);
 }
+
+#[test]
+fn element_select_str_is_relative_like_xpath() {
+    let order = Selector::parse("//order[@id='1']")
+        .unwrap()
+        .select_str(DOC)
+        .next()
+        .unwrap()
+        .unwrap()
+        .into_element()
+        .unwrap();
+    let t = |p: &str| -> Vec<String> {
+        order.select_str(p).unwrap().into_iter().map(|m| m.to_text()).collect()
+    };
+    assert_eq!(t("sku/text()"), ["a", "b"]);
+    assert_eq!(t("./sku/text()"), ["a", "b"]);
+    assert_eq!(t("./sku[2]/text()"), ["b"]);
+    assert_eq!(t(".//sku/text()"), ["a", "b"]);
+    assert_eq!(t("@id"), ["1"]);
+    assert_eq!(t("./@status"), Vec::<String>::new()); // attributes of *children*: none
+    assert_eq!(t("./note/text()"), ["hi & bye"]);
+    assert_eq!(t("."), ["abhi & bye"]);
+    assert_eq!(t("order"), Vec::<String>::new()); // the element itself is not its own child
+}

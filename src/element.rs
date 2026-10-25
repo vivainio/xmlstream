@@ -105,13 +105,30 @@ impl Element {
         s
     }
 
-    /// Runs a selector against this element as if it were the document root.
+    /// Runs a selector against this element as if it were the document root: the element
+    /// itself is the first thing it can match. For paths relative to the element, see
+    /// [`select_str`](Self::select_str).
     pub fn select(&self, sel: &Selector) -> Result<Vec<Match>> {
         sel.select_element(self)
     }
 
+    /// Selects relative to this element, like XPath from a context node, and with the same
+    /// path rules as `Extract` fields: `foo` and `./foo` are child elements, `.//foo` and
+    /// `//foo` any descendant, `./foo/@id` an attribute, `@id` this element's own attribute,
+    /// `text()` its own text and `.` all its text.
     pub fn select_str(&self, path: &str) -> Result<Vec<Match>> {
-        self.select(&Selector::parse(path)?)
+        let p = path.trim();
+        if p == "." {
+            return Ok(vec![Match::Text(self.text())]);
+        }
+        if p == "text()" {
+            let t = self.direct_text();
+            return Ok(if t.is_empty() { vec![] } else { vec![Match::Text(t)] });
+        }
+        if let Some(a) = p.strip_prefix('@').filter(|a| !a.is_empty() && !a.contains('/')) {
+            return Ok(self.attr(a).map(|v| Match::Attr(v.to_string())).into_iter().collect());
+        }
+        Ok(Selector::parse_relative(p)?.select_children(self))
     }
 
     /// Feeds this subtree as events (start, children, end).

@@ -173,3 +173,21 @@ fn per_record_state_never_leaks_into_the_next_record() {
     assert_eq!(j[2], r#"{"id":"3","tag":"y","vs":["c"],"n":null,"own":null,"all":"c"}"#);
     assert_eq!(j[3], r#"{"id":null,"tag":null,"vs":[],"n":null,"own":null,"all":null}"#);
 }
+
+#[test]
+fn dot_slash_paths_work_like_xpath() {
+    let xml = "<r><order id='1'><foo>a</foo><x><foo>deep</foo></x><bar k='v'><baz>z</baz></bar></order></r>";
+    let ex = Extract::parse(
+        "//order { direct = ./foo/text(); any = .//foo/text() *; k = ./bar/@k; z = ./bar/baz/text(); has = ./bar[./baz] ? }",
+    )
+    .unwrap();
+    let r = ex.run_str(xml).next().unwrap().unwrap();
+    assert_eq!(r["direct"].as_str(), Some("a"));
+    assert_eq!(r["any"].as_list().unwrap().len(), 2);
+    assert_eq!(r["k"].as_str(), Some("v"));
+    assert_eq!(r["z"].as_str(), Some("z"));
+    assert!(!r["has"].is_null()); // predicate paths accept ./ too
+    // `.` on its own is still the element's whole text
+    let ex = Extract::parse("//foo { all = . }").unwrap();
+    assert_eq!(ex.run_str(xml).next().unwrap().unwrap()["all"].as_str(), Some("a"));
+}

@@ -480,6 +480,10 @@ impl Selector {
             i: 0,
         };
         p.ws();
+        // In a relative path `./foo` means `foo` and `.//foo` means `//foo`.
+        if default_axis == Axis::Child && p.s[p.i..].starts_with(&['.', '/']) {
+            p.i += 1;
+        }
         let mut axis = if p.eat("//") {
             Axis::Descendant
         } else if p.eat("/") {
@@ -625,7 +629,7 @@ impl Selector {
     }
 
     /// Runs against the children of `e`, so `e` itself plays the document node.
-    fn select_children(&self, e: &Element) -> Vec<Match> {
+    pub(crate) fn select_children(&self, e: &Element) -> Vec<Match> {
         let mut engine = Engine::new(vec![self.clone()].into(), Limits::default());
         let mut out = VecDeque::new();
         let mut feed = |ev: Event| {
