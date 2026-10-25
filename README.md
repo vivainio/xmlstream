@@ -153,6 +153,52 @@ let stats = router.run(Reader::new(file))?;   // one pass; stats.skipped = dropp
   closing tag, attribute matches at the start tag). A handler error ends the run.
 - **`Flow::Stop` ends the whole run**, for every route. Nothing more is parsed.
 
+### Streaming a subtree instead of buffering it
+
+For an element too big to build, the gate can answer `Take::Stream`. Nothing is
+buffered; the route's stream callback gets every event of the subtree as it is
+parsed, and can feed them to a `Matcher` (selectors) or a `Writer` (copy or
+transform).
+
+```rust
+use xmlstream::{Flow, Reader, Router, Selector, Take};
+
+let skus = Selector::parse("item/@sku")?;
+let mut matcher = None;
+let mut router = Router::new();
+router.on_split(
+    "/r/*",
+    |tag, _| if tag.name == "big" { Take::Stream } else { Take::Buffer },
+    |m, _| { small(m.into_element().unwrap()); Ok(Flow::Continue) },   // buffered
+    |item, _| {                                                        // streamed
+        if item.is_first() { matcher = Some(skus.matcher()); }
+        for (_, hit) in matcher.as_mut().unwrap().feed(item.event)? {
+            record(hit.to_text());
+        }
+        Ok(Flow::Continue)
+    },
+)?;
+router.run(Reader::new(file))?;
+```
+
+- A gate returns a `Take` (`Buffer`, `Stream` or `Skip`); a plain `bool` still
+  works (`true` is `Buffer`).
+- `on_stream(path, cb)` always streams, `on_stream_gated` streams what the gate
+  picks, and `on_split` lets the gate choose per candidate between a handler and
+  a stream callback.
+- Each `StreamItem` has the `event` and its `depth` relative to the matched
+  element (0 for its own start and end tags). `is_first()` and `is_last()` mark
+  the two ends, so you know when to reset per-element state.
+- A `Matcher` fed the events treats the streamed element as the document root, so
+  `item/@sku` means that element's `item` children. `Matcher::feed` returns the
+  matches each event completes. Streaming costs no budget; only what you collect
+  yourself uses memory.
+- Only element paths can be streamed, and not ones with child-content predicates
+  (`[sku='a']`), since those need the content before they can decide. Registering
+  such a route is an error.
+- Outside a router, `Selector::select_events(iter)` runs a selector over any
+  iterator of `Event`s, and `Selector::matcher()` is the push equivalent.
+
 ### Switching logic while parsing
 
 Every gate and handler also receives a `Control`, which changes the set of routes

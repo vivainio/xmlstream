@@ -21,7 +21,7 @@ mod writer;
 
 pub use element::{Element, Node};
 pub use error::{Error, Result};
-pub use path::{Hits, Limits, Match, Overflow, Select, Selector, SelectorSet, StartTag};
+pub use path::{Hits, Limits, Match, Matcher, Overflow, Select, Selector, SelectorSet, StartTag};
 pub use reader::{Event, Options, Reader};
-pub use router::{Control, Flow, RouteBuilder, RouteId, Router, Stats};
+pub use router::{Control, Flow, RouteBuilder, RouteId, Router, Stats, StreamItem, Take};
 pub use writer::Writer;

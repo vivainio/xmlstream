@@ -567,21 +567,58 @@ impl Selector {
     }
 
     /// Streams matches out of `reader` one at a time.
-    pub fn select<R: Read>(&self, reader: Reader<R>) -> Select<R> {
+    pub fn select<R: Read>(&self, reader: Reader<R>) -> Select<Reader<R>> {
         self.select_with(reader, Limits::default())
     }
 
     /// Like `select`, with a memory budget for buffered candidates.
-    pub fn select_with<R: Read>(&self, reader: Reader<R>, limits: Limits) -> Select<R> {
+    pub fn select_with<R: Read>(&self, reader: Reader<R>, limits: Limits) -> Select<Reader<R>> {
+        self.select_events_with(reader, limits)
+    }
+
+    pub fn select_str<'a>(&self, xml: &'a str) -> Select<Reader<std::io::Cursor<&'a [u8]>>> {
+        self.select(Reader::from_str(xml))
+    }
+
+    /// Streams matches out of any source of events: a `Reader`, a `Vec<Event>`, another
+    /// pipeline stage. The first element that opens plays the document root.
+    pub fn select_events<I>(&self, events: I) -> Select<I::IntoIter>
+    where
+        I: IntoIterator<Item = Result<Event>>,
+    {
+        self.select_events_with(events, Limits::default())
+    }
+
+    pub fn select_events_with<I>(&self, events: I, limits: Limits) -> Select<I::IntoIter>
+    where
+        I: IntoIterator<Item = Result<Event>>,
+    {
         Select(
             SelectorSet::from_selectors(vec![self.clone()])
                 .limits(limits)
-                .select(reader),
+                .select_events(events),
         )
     }
 
-    pub fn select_str<'a>(&self, xml: &'a str) -> Select<std::io::Cursor<&'a [u8]>> {
-        self.select(Reader::from_str(xml))
+    /// A push-style matcher: feed it events one at a time, as they arrive from somewhere else.
+    pub fn matcher(&self) -> Matcher {
+        self.matcher_with(Limits::default())
+    }
+
+    pub fn matcher_with(&self, limits: Limits) -> Matcher {
+        SelectorSet::from_selectors(vec![self.clone()])
+            .limits(limits)
+            .matcher()
+    }
+
+    /// True when a match can only be decided after reading the element's content, so it has to
+    /// be buffered.
+    pub(crate) fn needs_buffering(&self) -> bool {
+        self.steps.iter().any(Step::has_deferred)
+    }
+
+    pub(crate) fn yields_elements(&self) -> bool {
+        self.output == Output::Element
     }
 
     /// Runs against the children of `e`, so `e` itself plays the document node.
@@ -642,13 +679,49 @@ impl SelectorSet {
         Ok(self.sels.len() - 1)
     }
 
-    pub fn select<R: Read>(&self, reader: Reader<R>) -> Hits<R> {
+    pub fn select<R: Read>(&self, reader: Reader<R>) -> Hits<Reader<R>> {
+        self.select_events(reader)
+    }
+
+    pub fn select_events<I>(&self, events: I) -> Hits<I::IntoIter>
+    where
+        I: IntoIterator<Item = Result<Event>>,
+    {
         Hits {
-            reader,
+            events: events.into_iter(),
             engine: Engine::new(self.sels.clone(), self.limits),
             queue: VecDeque::new(),
             failed: false,
         }
+    }
+
+    pub fn matcher(&self) -> Matcher {
+        Matcher {
+            engine: Engine::new(self.sels.clone(), self.limits),
+            queue: VecDeque::new(),
+        }
+    }
+}
+
+/// Matching driven by the caller: `feed` one event, get the matches it completes.
+///
+/// Use it where events arrive by push rather than by pull, for example inside a
+/// [`Router`](crate::Router) stream callback. Hits carry the index of the selector in the
+/// set; a matcher made from a single `Selector` always reports 0.
+pub struct Matcher {
+    engine: Engine,
+    queue: VecDeque<(usize, Match)>,
+}
+
+impl Matcher {
+    pub fn feed(&mut self, ev: &Event) -> Result<Vec<(usize, Match)>> {
+        self.engine.feed(ev, &mut self.queue, &mut allow_all)?;
+        Ok(self.queue.drain(..).collect())
+    }
+
+    /// Candidates dropped so far because of `Overflow::Skip`.
+    pub fn skipped(&self) -> u64 {
+        self.engine.skipped
     }
 }
 
@@ -657,14 +730,14 @@ fn allow_all(_: usize, _: &StartTag) -> bool {
 }
 
 /// Iterator of `(selector index, match)`.
-pub struct Hits<R: Read> {
-    reader: Reader<R>,
+pub struct Hits<I> {
+    events: I,
     engine: Engine,
     queue: VecDeque<(usize, Match)>,
     failed: bool,
 }
 
-impl<R: Read> Iterator for Hits<R> {
+impl<I: Iterator<Item = Result<Event>>> Iterator for Hits<I> {
     type Item = Result<(usize, Match)>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -675,15 +748,15 @@ impl<R: Read> Iterator for Hits<R> {
             if self.failed {
                 return None;
             }
-            match self.reader.next_event() {
-                Ok(Some(ev)) => {
+            match self.events.next() {
+                Some(Ok(ev)) => {
                     if let Err(e) = self.engine.feed(&ev, &mut self.queue, &mut allow_all) {
                         self.failed = true;
                         return Some(Err(e));
                     }
                 }
-                Ok(None) => return None,
-                Err(e) => {
+                None => return None,
+                Some(Err(e)) => {
                     self.failed = true;
                     return Some(Err(e));
                 }
@@ -693,9 +766,9 @@ impl<R: Read> Iterator for Hits<R> {
 }
 
 /// Iterator of matches for a single selector.
-pub struct Select<R: Read>(Hits<R>);
+pub struct Select<I>(Hits<I>);
 
-impl<R: Read> Iterator for Select<R> {
+impl<I: Iterator<Item = Result<Event>>> Iterator for Select<I> {
     type Item = Result<Match>;
 
     fn next(&mut self) -> Option<Self::Item> {

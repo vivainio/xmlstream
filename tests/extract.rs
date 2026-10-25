@@ -507,3 +507,123 @@ fn bad_dynamic_path_is_an_error_not_a_panic() {
         .unwrap();
     assert!(router.run(Reader::from_str(EU_US)).is_err());
 }
+
+use xmlstream::Take;
+
+fn blob_doc(items: usize) -> String {
+    let mut s = String::from("<r><small id='s1'><item sku='x'/></small><big id='b1'>");
+    for i in 0..items {
+        s.push_str(&format!("<item sku='k{i}'><pad>{}</pad></item>", "p".repeat(50)));
+    }
+    s.push_str("</big><small id='s2'><item sku='y'/></small></r>");
+    s
+}
+
+#[test]
+fn stream_a_subtree_into_a_matcher_with_no_buffering() {
+    // The big element is ~7 MB; the budget is a few KB. Streaming never builds it.
+    let doc = blob_doc(100_000);
+    let sel = Selector::parse("item/@sku").unwrap();
+    let mut m = None;
+    let mut skus = 0;
+    let mut events = 0;
+    let mut router = Router::new().limits(Limits { max_total_bytes: 4096, ..Default::default() });
+    router
+        .on_stream("/r/big", |it, _| {
+            events += 1;
+            if it.is_first() {
+                m = Some(sel.matcher());
+            }
+            skus += m.as_mut().unwrap().feed(it.event)?.len();
+            Ok(Flow::Continue)
+        })
+        .unwrap();
+    router.run(Reader::from_str(&doc)).unwrap();
+    drop(router);
+    assert_eq!(skus, 100_000);
+    assert!(events > 300_000);
+}
+
+#[test]
+fn gate_picks_buffer_or_stream_per_candidate() {
+    let doc = blob_doc(1000);
+    let buffered = Rc::new(RefCell::new(vec![]));
+    let streamed = Rc::new(RefCell::new((0usize, vec![])));
+    let (b, s) = (buffered.clone(), streamed.clone());
+    let mut router = Router::new().limits(Limits { max_element_bytes: 2000, ..Default::default() });
+    router
+        .on_split(
+            "/r/*",
+            |tag, _| if tag.name == "big" { Take::Stream } else { Take::Buffer },
+            move |m, _| {
+                b.borrow_mut().push(m.as_element().unwrap().attr("id").unwrap().to_string());
+                Ok(Flow::Continue)
+            },
+            move |it, _| {
+                let mut s = s.borrow_mut();
+                s.0 += 1;
+                if it.depth == 0 {
+                    s.1.push(matches!(it.event, Event::Start { .. }));
+                }
+                Ok(Flow::Continue)
+            },
+        )
+        .unwrap();
+    router.run(Reader::from_str(&doc)).unwrap();
+    assert_eq!(*buffered.borrow(), ["s1", "s2"]);
+    let s = streamed.borrow();
+    assert_eq!(s.1, [true, false]); // one start, one end at depth 0
+    assert!(s.0 > 1000);
+}
+
+#[test]
+fn stream_depth_and_first_last() {
+    let mut seen = vec![];
+    let mut router = Router::new();
+    router
+        .on_stream("//b", |it, _| {
+            let tag = match it.event {
+                Event::Start { name, .. } => format!("<{name}"),
+                Event::End { name } => format!("/{name}"),
+                Event::Text(t) => format!("'{t}'"),
+                _ => "?".into(),
+            };
+            seen.push(format!("{}{}{}{}", it.depth, tag, if it.is_first() { "^" } else { "" }, if it.is_last() { "$" } else { "" }));
+            Ok(Flow::Continue)
+        })
+        .unwrap();
+    router.run(Reader::from_str("<a><b><c>t</c></b><d/></a>")).unwrap();
+    drop(router);
+    assert_eq!(seen, ["0<b^", "1<c", "2't'", "1/c", "0/b$"]);
+}
+
+#[test]
+fn stream_route_rules() {
+    let mut router = Router::new();
+    assert!(router.on_stream("//a/@x", |_, _| Ok(Flow::Continue)).is_err());
+    assert!(router.on_stream("//a[b='1']", |_, _| Ok(Flow::Continue)).is_err());
+    assert!(router.on_stream("//a[@x='1']", |_, _| Ok(Flow::Continue)).is_ok());
+    // a gate answering Stream for a route without a stream callback is reported, not ignored
+    let mut router = Router::new();
+    router.on_gated("//order", |_, _| Take::Stream, |_, _| Ok(Flow::Continue)).unwrap();
+    assert!(router.run(Reader::from_str(DOC)).is_err());
+}
+
+#[test]
+fn matcher_and_select_events_outside_a_router() {
+    let events: Vec<_> = Reader::from_str(DOC).map(|e| e.unwrap()).collect();
+    let sel = Selector::parse("//order/@id").unwrap();
+    // pull: any iterator of events
+    let ids: Vec<_> = sel
+        .select_events(events.iter().cloned().map(Ok))
+        .map(|m| m.unwrap().to_text())
+        .collect();
+    assert_eq!(ids, ["1", "2", "3", "4"]);
+    // push: one event at a time
+    let mut m = sel.matcher();
+    let mut ids = vec![];
+    for ev in &events {
+        ids.extend(m.feed(ev).unwrap().into_iter().map(|(_, h)| h.to_text()));
+    }
+    assert_eq!(ids, ["1", "2", "3", "4"]);
+}
