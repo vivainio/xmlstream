@@ -771,6 +771,21 @@ impl Matcher {
         Ok(())
     }
 
+    /// Like [`feed_with`](Self::feed_with). `gate` is called as an element starts that selector `i` matches; answer `false` to not
+    /// buffer it (and get no match for it), `true` to carry on as usual.
+    pub(crate) fn feed_gated(
+        &mut self,
+        ev: EventRef<'_>,
+        gate: &mut dyn FnMut(usize, &[(String, String)]) -> bool,
+        mut f: impl FnMut(usize, Match),
+    ) -> Result<()> {
+        self.engine.feed(ev, &mut self.queue, gate)?;
+        while let Some((i, m)) = self.queue.pop_front() {
+            f(i, m);
+        }
+        Ok(())
+    }
+
     /// Like [`feed`](Self::feed), for borrowed events (see `Reader::next_ref`).
     pub fn feed_ref(&mut self, ev: EventRef<'_>) -> Result<Vec<(usize, Match)>> {
         self.engine.feed(ev, &mut self.queue, &mut allow_all)?;

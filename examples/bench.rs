@@ -1,5 +1,6 @@
 //! `cargo run --release --example bench -- FILE MODE`
-//! Modes: events, events_ref, attr, text, element, extract, extract_wide, extract_many
+//! Modes: events, events_ref, attr, text, element, extract, extract_wide, extract_many,
+//! extract_nested
 
 use std::{fs::File, time::Instant};
 
@@ -23,7 +24,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             n
         }
         "attr" => Selector::parse("//order/@id")?.select(reader).count(),
-        "text" => Selector::parse("//order/sku/text()")?.select(reader).count(),
+        "text" => Selector::parse("//order/sku/text()")?
+            .select(reader)
+            .count(),
         "element" => Selector::parse("//order")?.select(reader).count(),
         "extract" => Extract::parse("//order { id = @id; total = total/text() as number }")?
             .run(reader)
@@ -41,9 +44,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?
         .run(reader)
         .count(),
+        "extract_nested" => {
+            let ex = Extract::parse(
+                "//order { id = @id; skus = ./sku { v = ./text() } * ; total = total/text() as number }",
+            )?;
+            let mut items = 0;
+            let mut n = 0;
+            for rec in ex.run(reader) {
+                items += rec?["skus"].as_list().map_or(0, |l| l.len());
+                n += 1;
+            }
+            assert!(items > 0);
+            n
+        }
         m => panic!("unknown mode {m}"),
     };
     let s = t.elapsed().as_secs_f64();
-    println!("{mode:13} {n:>9} results  {s:6.2}s  {:6.0} MB/s", size / 1e6 / s);
+    println!(
+        "{mode:13} {n:>9} results  {s:6.2}s  {:6.0} MB/s",
+        size / 1e6 / s
+    );
     Ok(())
 }

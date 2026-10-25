@@ -117,16 +117,32 @@ impl Element {
     /// `//foo` any descendant, `./foo/@id` an attribute, `@id` this element's own attribute,
     /// `text()` its own text and `.` all its text.
     pub fn select_str(&self, path: &str) -> Result<Vec<Match>> {
-        let p = path.trim();
+        let mut p = path.trim();
+        if let Some(rest) = p.strip_prefix("./") {
+            if rest == "text()" || (rest.starts_with('@') && !rest.contains('/')) {
+                p = rest; // ./@id and ./text() are the element's own, as in XPath
+            }
+        }
         if p == "." {
             return Ok(vec![Match::Text(self.text())]);
         }
         if p == "text()" {
             let t = self.direct_text();
-            return Ok(if t.is_empty() { vec![] } else { vec![Match::Text(t)] });
+            return Ok(if t.is_empty() {
+                vec![]
+            } else {
+                vec![Match::Text(t)]
+            });
         }
-        if let Some(a) = p.strip_prefix('@').filter(|a| !a.is_empty() && !a.contains('/')) {
-            return Ok(self.attr(a).map(|v| Match::Attr(v.to_string())).into_iter().collect());
+        if let Some(a) = p
+            .strip_prefix('@')
+            .filter(|a| !a.is_empty() && !a.contains('/'))
+        {
+            return Ok(self
+                .attr(a)
+                .map(|v| Match::Attr(v.to_string()))
+                .into_iter()
+                .collect());
         }
         Ok(Selector::parse_relative(p)?.select_children(self))
     }

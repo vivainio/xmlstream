@@ -77,7 +77,7 @@ xmlstream -e '//order { id = @id; skus = sku/text() * }' orders.xml   # NDJSON, 
 
 ## Performance
 
-Release build, one thread, on a 78 MB file of 400,000 pretty-printed orders (about
+Release build, one thread, on a 82 MB file of 400,000 pretty-printed orders (about
 9.4 million events), read from disk. Peak memory was about 2 MB in every case.
 
 | What | Results | Time | Throughput |
@@ -88,9 +88,10 @@ Release build, one thread, on a 78 MB file of 400,000 pretty-printed orders (abo
 | `//order/@id` | 400,000 | 0.46 s | 178 MB/s |
 | `//order/sku/text()` | 1,000,563 | 0.51 s | 159 MB/s |
 | `//order` (build each element) | 400,000 | 0.77 s | 106 MB/s |
-| `Extract`, 2 fields | 400,000 records | 0.62 s | 132 MB/s |
-| `Extract`, 7 fields (list, optional, element, constant) | 400,000 records | 0.90 s | 91 MB/s |
-| `Extract`, 3 rules with predicates | 408,000 records | 0.73 s | 111 MB/s |
+| `Extract`, 2 fields | 400,000 records | 0.65 s | 126 MB/s |
+| `Extract`, 7 fields (list, optional, element, constant) | 400,000 records | 0.93 s | 88 MB/s |
+| `Extract`, nested: 1 field + 1 nested record per `sku` (1 M children) | 400,000 records | 0.85 s | 96 MB/s |
+| `Extract`, 3 rules with predicates | 408,000 records | 0.76 s | 108 MB/s |
 
 Reproduce with `cargo run --release --example bench -- FILE MODE`
 (`examples/floor.rs` is the quick-xml baseline). Memory does not grow with the file.
@@ -122,7 +123,8 @@ of record, and every record knows its rule (`rule_name()`, `rule_index()`).
 
 - **Fields** are written `name = path`, separated by a newline or `;`. Paths are
   relative to the record: `sku` and `./sku` are children, `//sku` and `.//sku` any descendant, `@id` the
-  record's own attribute, `text()` its own text, `.` all its text.
+  record's own attribute, `text()` its own text, `.` all its text (`./@id` and
+  `./text()` mean the same as `@id` and `text()`, as in XPath).
 - **Types**: `as text` (default), `int`, `number`, `bool`. A value that doesn't
   parse is an error that names the rule, field and value.
 - **How many**: no marker is exactly one (missing is an error), `?` optional
@@ -142,6 +144,62 @@ of record, and every record knows its rule (`rule_name()`, `rule_index()`).
   (`//order[sku='a']`). Put the condition in your code, or select the field.
 - Rules in text have `#` comments. Mistakes are reported with the line number.
 
+### Nested records: parents and their children
+
+A field can itself be a block of fields. Its path selects the child elements; each
+one becomes a record of its own, so `rec["items"]` is a list you can loop over, with
+the parent's fields in scope in the outer loop:
+
+```rust
+let ex = Extract::parse(r#"
+    order = //order {
+        id    = @id
+        total = total/text() as number
+        items = ./items/item {            # a nested record per <item>
+            sku  = @sku
+            qty  = @qty as int
+            note = ./note/text() ?
+            tags = ./tag/text() *
+        } *                               # same markers: none = one, ? * +
+    }
+"#)?;
+
+for rec in ex.run(Reader::new(file)) {
+    let rec = rec?;
+    for item in rec["items"].as_list().unwrap() {
+        println!("{} {} x{}", rec["id"], item["sku"], item["qty"]);
+    }
+}
+// {"id":"1","total":9.5,"items":[{"sku":"a","qty":2,"note":"x","tags":["t1","t2"]}, ...]}
+```
+
+The same in the builder:
+
+```rust
+Extract::new()
+    .rule("//order")
+        .field("id", "@id")
+        .field("items", "./items/item").nested(|i| i
+            .field("sku", "@sku")
+            .field("qty", "@qty").int()
+            .field("note", "./note/text()").optional()).many()
+    .build()?
+```
+
+- **Nesting is unlimited**: a nested block can contain more blocks (order, items,
+  item, parts), and a block can match its own element name (folders in folders).
+- **Paths are relative to the child**, and the parent can still read the same data
+  with its own paths (`all_skus = .//item/@sku *`).
+- **Streaming, not buffering**: when a child element starts, a child record is filled
+  from the stream and handed to its parent when it closes. Neither the order nor
+  the item is ever built; memory is the extracted values, like a list field.
+- `item["sku"]` reads a field; a missing field or a non-record reads as `Null`.
+  `item.as_record()` gives the `Record`, whose `rule_name()` is the field name.
+- A nested record's path must select elements and cannot use child-content
+  predicates, as for rules. Errors name the whole path, for example `order.items`.
+- Children finish before their parent, so nested records of the same name come out
+  innermost first.
+
 When rules aren't enough, drop down to the selectors below, or to events.
 
 ### "Find each `//order`, then select `./foo` inside it"
@@ -151,7 +209,7 @@ is a path evaluated from that order, with the same spelling you'd use in XPath:
 
 | In XPath, from an order | As a field |
 |---|---|
-| `./@id`, `@id` | `id = @id` |
+| `./@id`, `@id` | `id = @id` (the record's own attribute) |
 | `./foo/text()` | `foo = ./foo/text()` (or `foo/text()`) |
 | `./foo` (string value) | `foo = ./foo` |
 | `.//foo` | `foo = .//foo/text() *` |
@@ -170,6 +228,9 @@ for m in Selector::parse("//order")?.select(Reader::new(file)) {
     let id   = order.select_str("@id")?;              // its own attribute
 }
 ```
+
+For the parent-then-children shape, nest a block instead of a second loop (see
+Nested records below): `items = ./items/item { sku = @sku; qty = @qty as int } *`.
 
 Prefer a rule when you only need some fields: the fields are collected while the
 order streams past and the order itself is never built. Use the loop when you need

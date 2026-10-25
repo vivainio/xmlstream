@@ -282,7 +282,9 @@ use xmlstream::{Error, Limits, Overflow};
 fn big_doc() -> String {
     let mut s = String::from("<r>");
     for i in 0..1000 {
-        s.push_str(&format!("<order id='{i}' kind='small'><sku>{i}</sku></order>"));
+        s.push_str(&format!(
+            "<order id='{i}' kind='small'><sku>{i}</sku></order>"
+        ));
     }
     s.push_str("<order id='huge' kind='big'><blob>");
     s.push_str(&"x".repeat(100_000));
@@ -292,7 +294,10 @@ fn big_doc() -> String {
 
 #[test]
 fn budget_errors_by_default() {
-    let limits = Limits { max_element_bytes: 1000, ..Default::default() };
+    let limits = Limits {
+        max_element_bytes: 1000,
+        ..Default::default()
+    };
     let r: Result<Vec<_>, _> = Selector::parse("//order")
         .unwrap()
         .select_with(Reader::from_str(&big_doc()), limits)
@@ -302,7 +307,11 @@ fn budget_errors_by_default() {
 
 #[test]
 fn budget_skip_drops_only_the_big_one() {
-    let limits = Limits { max_element_bytes: 1000, on_overflow: Overflow::Skip, ..Default::default() };
+    let limits = Limits {
+        max_element_bytes: 1000,
+        on_overflow: Overflow::Skip,
+        ..Default::default()
+    };
     let n = Selector::parse("//order")
         .unwrap()
         .select_with(Reader::from_str(&big_doc()), limits)
@@ -314,7 +323,11 @@ fn budget_skip_drops_only_the_big_one() {
 #[test]
 fn total_budget_is_released_as_candidates_finish() {
     // 1000 sequential candidates fit in a budget that holds only a couple at once.
-    let limits = Limits { max_total_bytes: 200, max_element_bytes: 200, ..Default::default() };
+    let limits = Limits {
+        max_total_bytes: 200,
+        max_element_bytes: 200,
+        ..Default::default()
+    };
     let doc = &big_doc().replace(&"x".repeat(100_000), "x");
     let n = Selector::parse("//order")
         .unwrap()
@@ -357,7 +370,10 @@ fn borrowed_reader_matches_owned_and_reuses_buffers_safely() {
     assert_eq!(owned, borrowed);
     assert_eq!(
         owned[1],
-        Event::Start { name: "e".into(), attrs: vec![] },
+        Event::Start {
+            name: "e".into(),
+            attrs: vec![]
+        },
         "{owned:?}"
     );
     assert!(owned.contains(&Event::Text("x & y".into())));
@@ -366,8 +382,14 @@ fn borrowed_reader_matches_owned_and_reuses_buffers_safely() {
         attrs: vec![("p".into(), "1".into()), ("q".into(), "2".into())]
     }));
     // trimming works in place too
-    let t: Vec<Event> = Reader::from_str("<a>\n  <b> x </b>\n  y \n</a>").trim(true).map(|e| e.unwrap()).collect();
-    assert!(t.contains(&Event::Text("x".into())) && t.contains(&Event::Text("y".into())), "{t:?}");
+    let t: Vec<Event> = Reader::from_str("<a>\n  <b> x </b>\n  y \n</a>")
+        .trim(true)
+        .map(|e| e.unwrap())
+        .collect();
+    assert!(
+        t.contains(&Event::Text("x".into())) && t.contains(&Event::Text("y".into())),
+        "{t:?}"
+    );
 }
 
 #[test]
@@ -392,14 +414,21 @@ fn element_select_str_is_relative_like_xpath() {
         .into_element()
         .unwrap();
     let t = |p: &str| -> Vec<String> {
-        order.select_str(p).unwrap().into_iter().map(|m| m.to_text()).collect()
+        order
+            .select_str(p)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.to_text())
+            .collect()
     };
     assert_eq!(t("sku/text()"), ["a", "b"]);
     assert_eq!(t("./sku/text()"), ["a", "b"]);
     assert_eq!(t("./sku[2]/text()"), ["b"]);
     assert_eq!(t(".//sku/text()"), ["a", "b"]);
     assert_eq!(t("@id"), ["1"]);
-    assert_eq!(t("./@status"), Vec::<String>::new()); // attributes of *children*: none
+    assert_eq!(t("./@status"), ["open"]); // ./@x is the element's own attribute, as in XPath
+    assert_eq!(t("./sku/@nothing"), Vec::<String>::new());
+    assert_eq!(t("./text()"), Vec::<String>::new()); // order has no text of its own
     assert_eq!(t("./note/text()"), ["hi & bye"]);
     assert_eq!(t("."), ["abhi & bye"]);
     assert_eq!(t("order"), Vec::<String>::new()); // the element itself is not its own child
@@ -421,7 +450,8 @@ fn outer_loop_parents_inner_loop_children() {
                 "{id}:{}x{}{}",
                 item.attr("sku").unwrap(),
                 item.attr("qty").unwrap(),
-                note.first().map_or(String::new(), |n| format!("({})", n.to_text())),
+                note.first()
+                    .map_or(String::new(), |n| format!("({})", n.to_text())),
             ));
         }
     }

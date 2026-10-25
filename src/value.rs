@@ -11,6 +11,8 @@ pub enum Value {
     Number(f64),
     Bool(bool),
     List(Vec<Value>),
+    /// A nested record (see `Extract` blocks).
+    Record(Record),
 }
 
 static NULL: Value = Value::Null;
@@ -79,6 +81,13 @@ impl Value {
         }
     }
 
+    pub fn as_record(&self) -> Option<&Record> {
+        match self {
+            Value::Record(r) => Some(r),
+            _ => None,
+        }
+    }
+
     pub fn is_null(&self) -> bool {
         matches!(self, Value::Null)
     }
@@ -96,6 +105,7 @@ impl Value {
             Value::Int(i) => out.push_str(&i.to_string()),
             Value::Number(n) => out.push_str(&n.to_string()),
             Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+            Value::Record(r) => r.write_json(out, false),
             Value::List(l) => {
                 out.push('[');
                 for (i, v) in l.iter().enumerate() {
@@ -131,6 +141,7 @@ impl fmt::Display for Value {
         match self {
             Value::Null => Ok(()),
             Value::Text(s) => f.write_str(s),
+            Value::Record(r) => f.write_str(&r.to_json()),
             Value::Int(i) => write!(f, "{i}"),
             Value::Number(n) => write!(f, "{n}"),
             Value::Bool(b) => write!(f, "{b}"),
@@ -167,7 +178,10 @@ impl Record {
     }
 
     pub fn get(&self, field: &str) -> Option<&Value> {
-        self.fields.iter().find(|(k, _)| &**k == field).map(|(_, v)| v)
+        self.fields
+            .iter()
+            .find(|(k, _)| &**k == field)
+            .map(|(_, v)| v)
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&str, &Value)> {
@@ -193,11 +207,17 @@ impl Record {
     }
 
     fn json(&self, tag: bool) -> String {
-        let mut s = String::from("{");
+        let mut s = String::new();
+        self.write_json(&mut s, tag);
+        s
+    }
+
+    fn write_json(&self, s: &mut String, tag: bool) {
+        s.push('{');
         let mut first = true;
         if let (true, Some(n)) = (tag, &self.rule_name) {
             s.push_str("\"_rule\":");
-            json_string(&mut s, n);
+            json_string(s, n);
             first = false;
         }
         for (k, v) in &self.fields {
@@ -205,12 +225,11 @@ impl Record {
                 s.push(',');
             }
             first = false;
-            json_string(&mut s, k);
+            json_string(s, k);
             s.push(':');
-            v.write_json(&mut s);
+            v.write_json(s);
         }
         s.push('}');
-        s
     }
 }
 
@@ -220,5 +239,18 @@ impl Index<&str> for Record {
 
     fn index(&self, field: &str) -> &Value {
         self.get(field).unwrap_or(&NULL)
+    }
+}
+
+/// `value["sku"]` reads a field of a nested record; anything else reads as `Value::Null`, so
+/// `rec["items"].as_list()` entries can be indexed without unwrapping.
+impl Index<&str> for Value {
+    type Output = Value;
+
+    fn index(&self, field: &str) -> &Value {
+        match self {
+            Value::Record(r) => &r[field],
+            _ => &NULL,
+        }
     }
 }
