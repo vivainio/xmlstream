@@ -404,3 +404,26 @@ fn element_select_str_is_relative_like_xpath() {
     assert_eq!(t("."), ["abhi & bye"]);
     assert_eq!(t("order"), Vec::<String>::new()); // the element itself is not its own child
 }
+
+#[test]
+fn outer_loop_parents_inner_loop_children() {
+    let xml = "<r>\
+        <order id='1'><items><item sku='a' qty='2'><note>x</note></item><item sku='b' qty='1'/></items></order>\
+        <order id='2'><items><item sku='c' qty='5'/></items></order></r>";
+    let mut seen = vec![];
+    for order in Selector::parse("//order").unwrap().select_str(xml) {
+        let order = order.unwrap().into_element().unwrap();
+        let id = order.attr("id").unwrap().to_string();
+        for item in order.select_str("./items/item").unwrap() {
+            let item = item.into_element().unwrap();
+            let note = item.select_str("./note/text()").unwrap();
+            seen.push(format!(
+                "{id}:{}x{}{}",
+                item.attr("sku").unwrap(),
+                item.attr("qty").unwrap(),
+                note.first().map_or(String::new(), |n| format!("({})", n.to_text())),
+            ));
+        }
+    }
+    assert_eq!(seen, ["1:ax2(x)", "1:bx1", "2:cx5"]);
+}
