@@ -75,7 +75,25 @@ xmlstream --pretty '//order[2]' < orders.xml
 xmlstream -e '//order { id = @id; skus = sku/text() * }' orders.xml   # NDJSON, one record per line
 ```
 
-On a 1M-element, 43 MB file, finding one element takes about 0.7 s and 2 MB of memory.
+## Performance
+
+Release build, one thread, on a 78 MB file of 400,000 orders (about 9.4 million
+events), read from disk. Peak memory was about 2 MB in every case.
+
+| What | Results | Time | Throughput |
+|---|---|---|---|
+| Parse events only (`Reader`) | 9.4 M events | 0.69 s | 118 MB/s |
+| `//order/@id` | 400,000 | 0.93 s | 88 MB/s |
+| `//order/sku/text()` | 1,000,563 | 1.04 s | 79 MB/s |
+| `//order` (build each element) | 400,000 | 1.26 s | 64 MB/s |
+| `Extract`, 2 fields | 400,000 records | 1.61 s | 51 MB/s |
+| `Extract`, 7 fields (lists, optional, constant) | 400,000 records | 2.33 s | 35 MB/s |
+| `Extract`, 3 rules with predicates | 408,000 records | 1.86 s | 44 MB/s |
+
+Reproduce with `cargo run --release --example bench -- FILE MODE`. Throughput is
+bounded by the parser and by per-event allocation, not by file size; memory does not
+grow with the file.
+
 
 ## What's in the box
 
