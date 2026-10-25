@@ -69,11 +69,50 @@ A name without a prefix matches the local name, so `price` matches both
 
 ## Limits
 
-- It is an XPath subset. Predicates see an element's own start tag and its
-  position, never its children, because a single forward pass cannot look ahead.
-  `[sku='a']` is rejected.
-- Element matches arrive when the element closes, so a nested match is reported
-  before the match that contains it. Attribute matches arrive at the start tag.
+### Predicates can't look at children
+
+A streaming parser reads the file once, front to back. When it reaches
+`<order id="1">` it must decide immediately whether this element is a match, so it
+can start collecting it. At that moment it knows three things: the tag name, the
+attributes on that tag, and how many siblings came before it. It has not seen
+the children yet.
+
+So a predicate can use what is already known:
+
+```text
+//order[@status='open']     ok: attribute on the start tag
+//order[3]                  ok: position among siblings
+//order[contains(@id,'7')]  ok: attribute again
+//order[sku='a']            rejected: needs the <sku> child, which comes later
+//order[price > 100]        rejected: same reason
+```
+
+Answering `[sku='a']` would mean buffering every `order` until it closes, or
+reading the file twice. Both would break the constant-memory promise, so the
+selector refuses instead of quietly eating your RAM.
+
+**The workaround is to filter in code.** Each match is a small tree, so test it
+once it arrives. Memory stays bounded by one `order`:
+
+```rust
+let orders = Selector::parse("//order")?.select(Reader::new(file));
+for m in orders {
+    let order = m?.into_element().unwrap();
+    if order.child("sku").is_some_and(|s| s.text() == "a") {
+        // use it
+    }
+}
+```
+
+### Other limits
+
+- Element matches arrive when the element closes, so with nested matches
+  (`//a` on `<a><a/></a>`) the inner one comes out first. Attribute matches
+  arrive at the start tag.
+- `//` is only allowed before `@attr` or `text()` at the very start of a path.
+  Write `//*/@id`, not `a//@id`.
+- `item[2]` counts siblings with the same name test, before other predicates
+  are applied.
 - No validation: no XSD, no DTD, no entity expansion.
 
 For full XPath 1.0 or XSLT on files that fit in memory, use a DOM library.
