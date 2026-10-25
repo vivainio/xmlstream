@@ -1,0 +1,16 @@
+[package]
+name = "xmlstream"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/vivainio/xmlstream"
+keywords = ["xml", "streaming", "xpath", "parser"]
+categories = ["parser-implementations"]
+description = "Bounded-memory XML pull reader, strict writer, and an XPath-like streaming extractor"
+
+[dependencies]
+quick-xml = "0.38"
+
+[[bin]]
+name = "xmlstream"
+path = "src/main.rs"

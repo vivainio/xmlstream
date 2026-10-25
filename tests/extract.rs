@@ -1,0 +1,170 @@
+use xmlstream::{Element, Event, Match, Reader, Selector, SelectorSet, Writer};
+
+const DOC: &str = r#"<?xml version="1.0"?>
+<shop xmlns:x="urn:x">
+  <order id="1" status="open"><sku>a</sku><sku>b</sku><x:note>hi &amp; bye</x:note></order>
+  <order id="2" status="closed"><sku>c</sku></order>
+  <order id="3" status="open"/>
+  <group><order id="4" status="open"><sku>d</sku></order></group>
+</shop>"#;
+
+fn texts(path: &str) -> Vec<String> {
+    Selector::parse(path)
+        .unwrap()
+        .select_str(DOC)
+        .map(|m| m.unwrap().to_text())
+        .collect()
+}
+
+#[test]
+fn child_vs_descendant() {
+    assert_eq!(texts("/shop/order/@id"), ["1", "2", "3"]);
+    assert_eq!(texts("//order/@id"), ["1", "2", "3", "4"]);
+    assert_eq!(texts("order/@id"), ["1", "2", "3", "4"]);
+    assert_eq!(texts("/order/@id"), Vec::<String>::new());
+}
+
+#[test]
+fn predicates() {
+    assert_eq!(texts("//order[@status='open']/@id"), ["1", "3", "4"]);
+    assert_eq!(texts("//order[@status!='open']/@id"), ["2"]);
+    assert_eq!(texts("//order[starts-with(@id,'2')]/@status"), ["closed"]);
+    assert_eq!(texts("//order[contains(@status,'los')]/@id"), ["2"]);
+    assert_eq!(texts("/shop/order[2]/@id"), ["2"]);
+    assert_eq!(texts("//sku[2]"), ["b"]);
+}
+
+#[test]
+fn text_and_namespaces() {
+    assert_eq!(texts("//order/sku/text()"), ["a", "b", "c", "d"]);
+    assert_eq!(texts("//note/text()"), ["hi & bye"]);
+    assert_eq!(texts("//x:note/text()"), ["hi & bye"]);
+    assert_eq!(texts("//y:note/text()"), Vec::<String>::new());
+}
+
+#[test]
+fn element_subtrees() {
+    let els: Vec<Element> = Selector::parse("//order[@status='open']")
+        .unwrap()
+        .select_str(DOC)
+        .map(|m| m.unwrap().into_element().unwrap())
+        .collect();
+    assert_eq!(els.len(), 3);
+    assert_eq!(els[0].attr("id"), Some("1"));
+    assert_eq!(els[0].children_named("sku").count(), 2);
+    assert_eq!(els[0].child("note").unwrap().text(), "hi & bye");
+    assert_eq!(els[1].to_xml().unwrap(), r#"<order id="3" status="open"/>"#);
+}
+
+#[test]
+fn nested_matches_both_reported() {
+    let xml = "<a><a><a/></a></a>";
+    let n = Selector::parse("//a").unwrap().select_str(xml).count();
+    assert_eq!(n, 3);
+}
+
+#[test]
+fn sub_select_on_element() {
+    let order = Selector::parse("//order[@id='1']")
+        .unwrap()
+        .select_str(DOC)
+        .next()
+        .unwrap()
+        .unwrap()
+        .into_element()
+        .unwrap();
+    let skus: Vec<_> = order
+        .select_str("sku/text()")
+        .unwrap()
+        .into_iter()
+        .map(|m| m.to_text())
+        .collect();
+    assert_eq!(skus, ["a", "b"]);
+}
+
+#[test]
+fn selector_set_single_pass() {
+    let mut set = SelectorSet::new();
+    let ids = set.add("//order/@id").unwrap();
+    let skus = set.add("//sku/text()").unwrap();
+    let mut got = (vec![], vec![]);
+    for h in set.select(Reader::from_str(DOC)) {
+        let (i, m) = h.unwrap();
+        if i == ids { got.0.push(m.to_text()) } else if i == skus { got.1.push(m.to_text()) }
+    }
+    assert_eq!(got.0, ["1", "2", "3", "4"]);
+    assert_eq!(got.1, ["a", "b", "c", "d"]);
+}
+
+#[test]
+fn bad_paths() {
+    for p in ["", "/", "a[", "a[@]", "a[b='x']", "a/@id/b", "a//@id", "a[0]"] {
+        assert!(Selector::parse(p).is_err(), "{p:?} should not parse");
+    }
+}
+
+#[test]
+fn reader_rejects_bad_input() {
+    for x in ["<a>", "<a></b>", "<!DOCTYPE a><a/>", "<a/><b/>", "<a>&nope;</a>", "text", ""] {
+        assert!(Reader::from_str(x).any(|e| e.is_err()) || x.is_empty() && Reader::from_str(x).any(|e| e.is_err()), "{x:?}");
+    }
+}
+
+#[test]
+fn reader_limits() {
+    let opts = xmlstream::Options { max_depth: 3, ..Default::default() };
+    let r = Reader::with_options("<a><b><c><d/></c></b></a>".as_bytes(), opts);
+    assert!(r.into_iter().any(|e| e.is_err()));
+    let opts = xmlstream::Options { max_bytes: 10, ..Default::default() };
+    let r = Reader::with_options("<a>0123456789012345</a>".as_bytes(), opts);
+    assert!(r.into_iter().any(|e| e.is_err()));
+}
+
+#[test]
+fn reader_to_writer_roundtrip() {
+    let xml = r#"<a x="1 &amp; 2"><b>t&lt;</b><![CDATA[c]]><!--k--><e/></a>"#;
+    let mut w = Writer::new(Vec::new());
+    for ev in Reader::from_str(xml) {
+        w.write_event(&ev.unwrap()).unwrap();
+    }
+    assert_eq!(String::from_utf8(w.finish().unwrap()).unwrap(), xml);
+}
+
+#[test]
+fn writer_is_strict() {
+    let mut w = Writer::new(Vec::new());
+    assert!(w.text("x").is_err());
+    assert!(w.start("1bad").is_err());
+    w.start("a").unwrap();
+    assert!(w.text("\u{0}").is_err());
+    assert!(w.comment("a--b").is_err());
+    w.end().unwrap();
+    assert!(w.start("b").is_err());
+    assert!(w.end().is_err());
+    let mut w = Writer::new(Vec::new());
+    w.start("a").unwrap();
+    assert!(w.finish().is_err());
+}
+
+#[test]
+fn writer_pretty_and_declaration() {
+    let mut w = Writer::new(Vec::new()).indent(2).declaration(true);
+    w.start_with("a", &[("k", "v\"")]).unwrap();
+    w.text_element("b", "x").unwrap();
+    w.start("c").unwrap();
+    w.end().unwrap();
+    w.end().unwrap();
+    let s = String::from_utf8(w.finish().unwrap()).unwrap();
+    assert_eq!(
+        s,
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<a k=\"v&quot;\">\n  <b>x</b>\n  <c/>\n</a>\n"
+    );
+}
+
+#[test]
+fn trim_option() {
+    let evs: Vec<_> = Reader::from_str("<a>\n  <b> x </b>\n</a>").trim(true).map(|e| e.unwrap()).collect();
+    assert!(evs.contains(&Event::Text("x".into())));
+    assert_eq!(evs.iter().filter(|e| matches!(e, Event::Text(_))).count(), 1);
+    let _ = Match::Attr(String::new());
+}

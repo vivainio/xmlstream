@@ -1,0 +1,62 @@
+//! `xmlstream PATH [FILE]`: stream matches of an XPath-like PATH out of FILE (or stdin).
+
+use std::{
+    fs::File,
+    io::{self, BufWriter, Write},
+    process::ExitCode,
+};
+
+use xmlstream::{Match, Reader, Selector};
+
+const USAGE: &str = "usage: xmlstream [--pretty] [--trim] PATH [FILE]\n\
+  e.g. xmlstream '//order[@status=\"open\"]/@id' orders.xml";
+
+fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let mut pretty = false;
+    let mut trim = false;
+    let mut pos = Vec::new();
+    for a in std::env::args().skip(1) {
+        match a.as_str() {
+            "--pretty" => pretty = true,
+            "--trim" => trim = true,
+            "-h" | "--help" => {
+                println!("{USAGE}");
+                return Ok(());
+            }
+            _ => pos.push(a),
+        }
+    }
+    let (path, file) = match pos.as_slice() {
+        [p] => (p, None),
+        [p, f] => (p, Some(f)),
+        _ => return Err(USAGE.into()),
+    };
+    let sel = Selector::parse(path)?;
+    let input: Box<dyn io::Read> = match file {
+        Some(f) => Box::new(File::open(f)?),
+        None => Box::new(io::stdin().lock()),
+    };
+    let mut out = BufWriter::new(io::stdout().lock());
+    for m in sel.select(Reader::new(input).trim(trim || pretty)) {
+        match m? {
+            Match::Element(e) => {
+                let s = if pretty { e.to_xml_pretty(2)? } else { e.to_xml()? };
+                out.write_all(s.trim_end().as_bytes())?;
+            }
+            Match::Attr(s) | Match::Text(s) => out.write_all(s.as_bytes())?,
+        }
+        out.write_all(b"\n")?;
+    }
+    out.flush()?;
+    Ok(())
+}
+
+fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("{e}");
+            ExitCode::FAILURE
+        }
+    }
+}
