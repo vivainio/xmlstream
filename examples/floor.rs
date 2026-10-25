@@ -1,3 +1,5 @@
+//! Baseline: how fast bare quick-xml reads a file with no per-event allocation.
+//! `cargo run --release --example floor -- FILE`
 use std::{fs::File, io::BufReader, time::Instant};
 use quick_xml::{events::Event, Reader};
 fn main() {
