@@ -98,7 +98,7 @@ fn selector_set_single_pass() {
 
 #[test]
 fn bad_paths() {
-    for p in ["", "/", "a[", "a[@]", "a[b='x']", "a/@id/b", "a//@id", "a[0]"] {
+    for p in ["", "/", "a[", "a[@]", "a[b=]", "a[@x<'s']", "a/@id/b", "a//@id", "a[0]"] {
         assert!(Selector::parse(p).is_err(), "{p:?} should not parse");
     }
 }
@@ -167,4 +167,67 @@ fn trim_option() {
     assert!(evs.contains(&Event::Text("x".into())));
     assert_eq!(evs.iter().filter(|e| matches!(e, Event::Text(_))).count(), 1);
     let _ = Match::Attr(String::new());
+}
+
+#[test]
+fn child_predicates() {
+    assert_eq!(texts("//order[sku='a']/@id"), ["1"]);
+    assert_eq!(texts("//order[sku='d']/@id"), ["4"]);
+    assert_eq!(texts("//order[sku]/@id"), ["1", "2", "4"]);
+    assert_eq!(texts("//order[sku!='a']/@id"), ["1", "2", "4"]); // some sku differs
+    assert_eq!(texts("//order[contains(sku,'c')]/@id"), ["2"]);
+    assert_eq!(texts("//order[note='hi & bye']/@id"), ["1"]);
+    assert_eq!(texts("//order[sku='a'][@status='open']/@id"), ["1"]);
+    assert_eq!(texts("//order[sku='a'][@status='closed']/@id"), Vec::<String>::new());
+    // the rest of the path runs inside the accepted candidate
+    assert_eq!(texts("//order[sku='b']/sku/text()"), ["a", "b"]);
+    assert_eq!(texts("//order[@status='closed']/sku[1]/text()"), ["c"]);
+}
+
+#[test]
+fn numeric_predicates() {
+    let xml = "<r><i n='5'><p>9.5</p></i><i n='12'><p>100</p></i><i n='x'><p>abc</p></i></r>";
+    let q = |p: &str| -> Vec<String> {
+        Selector::parse(p).unwrap().select_str(xml).map(|m| m.unwrap().to_text()).collect()
+    };
+    assert_eq!(q("//i[@n>6]/@n"), ["12"]);
+    assert_eq!(q("//i[@n<=5]/@n"), ["5"]);
+    assert_eq!(q("//i[p>=100]/@n"), ["12"]);
+    assert_eq!(q("//i[p=9.5]/@n"), ["5"]);
+    assert_eq!(q("//i[p>0]/@n"), ["5", "12"]); // non-numbers never match
+}
+
+#[test]
+fn nested_child_paths_and_set() {
+    let xml = "<r><a><b><c k='1'/></b></a><a><b><c k='2'/></b></a></r>";
+    let n = |p: &str| Selector::parse(p).unwrap().select_str(xml).count();
+    assert_eq!(n("//a[b/c/@k='2']"), 1);
+    assert_eq!(n("//a[b/c]"), 2);
+    assert_eq!(n("//a[b/z]"), 0);
+}
+
+/// Only `Read`, one byte per call: no seeking, no lookahead beyond what was handed over.
+struct Dribble<'a>(&'a [u8]);
+
+impl std::io::Read for Dribble<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self.0.split_first() {
+            Some((b, rest)) if !buf.is_empty() => {
+                buf[0] = *b;
+                self.0 = rest;
+                Ok(1)
+            }
+            _ => Ok(0),
+        }
+    }
+}
+
+#[test]
+fn works_on_a_forward_only_stream() {
+    let ids: Vec<String> = Selector::parse("//order[sku='a']/@id")
+        .unwrap()
+        .select(Reader::new(Dribble(DOC.as_bytes())))
+        .map(|m| m.unwrap().to_text())
+        .collect();
+    assert_eq!(ids, ["1"]);
 }

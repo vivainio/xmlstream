@@ -39,7 +39,7 @@ On a 1M-element, 43 MB file, finding one element takes about 0.7 s and 2 MB of m
 
 ## What's in the box
 
-- **Selectors**: an XPath subset evaluated in a single forward pass.
+- **Selectors**: an XPath subset evaluated in a single forward pass, with no seeking.
   `SelectorSet` runs several selectors in one pass over the same stream.
 - **Reader**: a pull parser over any `Read`. Memory is bounded by one event.
   Input size and nesting depth are capped, and DOCTYPE is rejected, so hostile
@@ -60,7 +60,9 @@ On a 1M-element, 43 MB file, finding one element takes about 0.7 s and 2 MB of m
 | `item[3]` | third `item` among its siblings (1-based) |
 | `item[@id]` | has attribute |
 | `item[@id='x']`, `[@id!='x']` | attribute equals / differs |
+| `item[@n>5]` | numeric compare (`<` `<=` `>` `>=` `=` `!=`); non-numbers never match |
 | `item[contains(@id,'x')]`, `[starts-with(@id,'x')]` | string tests |
+| `order[sku='a']`, `[price>100]`, `[b/c]` | child content, decided when the element closes (see Limits) |
 | `//item/@id` | attribute value |
 | `//item/text()` | direct text of the element |
 
@@ -69,37 +71,43 @@ A name without a prefix matches the local name, so `price` matches both
 
 ## Limits
 
-### Predicates can't look at children
+### Predicates on children cost memory, not a second pass
 
-A streaming parser reads the file once, front to back. When it reaches
-`<order id="1">` it must decide immediately whether this element is a match, so it
-can start collecting it. At that moment it knows three things: the tag name, the
-attributes on that tag, and how many siblings came before it. It has not seen
-the children yet.
+The input is never rewound: xmlstream needs only `Read`, not `Seek`, so it works
+on pipes, sockets and decompression streams.
 
-So a predicate can use what is already known:
+A predicate on an element's own tag is free, because the tag is already read:
 
 ```text
-//order[@status='open']     ok: attribute on the start tag
-//order[3]                  ok: position among siblings
-//order[contains(@id,'7')]  ok: attribute again
-//order[sku='a']            rejected: needs the <sku> child, which comes later
-//order[price > 100]        rejected: same reason
+//order[@status='open']     attribute on the start tag
+//order[3]                  position among siblings
+//order[@qty>5]             numeric comparison
 ```
 
-Answering `[sku='a']` would mean buffering every `order` until it closes, or
-reading the file twice. Both would break the constant-memory promise, so the
-selector refuses instead of quietly eating your RAM.
+A predicate on content is different. When `<order id="1">` arrives, its `<sku>`
+child has not been read yet. Instead of seeking back, xmlstream keeps the
+candidate `order` in memory, and decides when it closes:
 
-**The workaround is to filter in code.** Each match is a small tree, so test it
-once it arrives. Memory stays bounded by one `order`:
+```text
+//order[sku='a']            child text
+//order[price>100]          numeric comparison on a child
+//order[contains(note,'x')] string test on a child
+//order[sku='a']/item/@id   then keep searching inside the accepted order
+```
+
+Memory is bounded by the **largest candidate**, not by the file. Keep candidates
+small: `//order[sku='a']` is fine, but `/orders[order]` makes the whole document the
+candidate. A predicate path is relative to the element and may go deeper
+(`[b/c/@k='2']`), but cannot contain predicates of its own.
+
+If you need logic beyond this, select the elements and test them in plain Rust,
+since each match is a small tree:
 
 ```rust
-let orders = Selector::parse("//order")?.select(Reader::new(file));
-for m in orders {
+for m in Selector::parse("//order")?.select(Reader::new(file)) {
     let order = m?.into_element().unwrap();
     if order.child("sku").is_some_and(|s| s.text() == "a") {
-        // use it
+        // anything you like
     }
 }
 ```

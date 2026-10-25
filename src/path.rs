@@ -1,5 +1,8 @@
 //! An XPath-like selector that runs over a stream of events.
 //!
+//! Predicates on a start tag are decided immediately; predicates on content (`[sku='a']`) hold the
+//! candidate element in memory and are decided when it closes. The input is never rewound.
+//!
 //! Supported syntax:
 //!
 //! ```text
@@ -72,22 +75,56 @@ enum Test {
     Name(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Op {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 enum Cond {
     Exists,
     Eq(String),
     Ne(String),
     Contains(String),
     StartsWith(String),
+    Num(Op, f64),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 enum Pred {
     Pos(usize),
     Attr { name: String, cond: Cond },
+    /// Looks at the element's content, so it is decided when the element closes.
+    Child { path: Selector, cond: Cond },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+impl Cond {
+    /// Everything except `Exists`, which depends on whether a value is there at all.
+    fn holds(&self, v: &str) -> bool {
+        match self {
+            Cond::Exists => true,
+            Cond::Eq(x) => v == x,
+            Cond::Ne(x) => v != x,
+            Cond::Contains(x) => v.contains(x.as_str()),
+            Cond::StartsWith(x) => v.starts_with(x.as_str()),
+            Cond::Num(op, n) => v.trim().parse::<f64>().is_ok_and(|f| match op {
+                Op::Eq => f == *n,
+                Op::Ne => f != *n,
+                Op::Lt => f < *n,
+                Op::Le => f <= *n,
+                Op::Gt => f > *n,
+                Op::Ge => f >= *n,
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 struct Step {
     axis: Axis,
     test: Test,
@@ -130,17 +167,34 @@ impl Step {
                 let v = attrs.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str());
                 match (cond, v) {
                     (Cond::Exists, v) => v.is_some(),
-                    (Cond::Eq(x), v) => v == Some(x.as_str()),
-                    (Cond::Ne(x), v) => v.is_some_and(|v| v != x),
-                    (Cond::Contains(x), v) => v.is_some_and(|v| v.contains(x.as_str())),
-                    (Cond::StartsWith(x), v) => v.is_some_and(|v| v.starts_with(x.as_str())),
+                    (c, v) => v.is_some_and(|v| c.holds(v)),
                 }
             }
+            // decided later, once the element has been read
+            Pred::Child { .. } => true,
+        })
+    }
+
+    fn has_deferred(&self) -> bool {
+        self.preds.iter().any(|p| matches!(p, Pred::Child { .. }))
+    }
+
+    /// The deferred predicates, checked against a fully read element.
+    fn deferred_hold(&self, el: &Element) -> bool {
+        self.preds.iter().all(|p| match p {
+            Pred::Child { path, cond } => {
+                let found = path.select_children(el);
+                match cond {
+                    Cond::Exists => !found.is_empty(),
+                    c => found.iter().any(|m| c.holds(&m.to_text())),
+                }
+            }
+            _ => true,
         })
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Selector {
     steps: Vec<Step>,
     output: Output,
@@ -217,6 +271,63 @@ impl Parser {
         Ok(n)
     }
 
+    /// A quoted string, or a bare number.
+    fn value(&mut self, src: &str, op: Op) -> Result<Cond> {
+        self.ws();
+        if matches!(self.peek(), Some('\'' | '"')) {
+            let lit = self.literal(src)?;
+            return match op {
+                Op::Eq => Ok(Cond::Eq(lit)),
+                Op::Ne => Ok(Cond::Ne(lit)),
+                _ => Err(perr(src, self.i, "< and > compare numbers, not strings")),
+            };
+        }
+        let start = self.i;
+        while self
+            .peek()
+            .is_some_and(|c| c.is_ascii_digit() || matches!(c, '.' | '-' | '+'))
+        {
+            self.i += 1;
+        }
+        let n: f64 = self.s[start..self.i]
+            .iter()
+            .collect::<String>()
+            .parse()
+            .map_err(|_| perr(src, start, "expected a quoted string or a number"))?;
+        Ok(Cond::Num(op, n))
+    }
+
+    fn operator(&mut self) -> Option<Op> {
+        self.ws();
+        for (lit, op) in [
+            ("!=", Op::Ne),
+            ("<=", Op::Le),
+            (">=", Op::Ge),
+            ("=", Op::Eq),
+            ("<", Op::Lt),
+            (">", Op::Gt),
+        ] {
+            if self.eat(lit) {
+                return Some(op);
+            }
+        }
+        None
+    }
+
+    /// A relative path inside a predicate, up to an operator or closing bracket.
+    fn rel_path(&mut self, src: &str) -> Result<Selector> {
+        let start = self.i;
+        while self
+            .peek()
+            .is_some_and(|c| !matches!(c, '=' | '!' | '<' | '>' | ']' | ',' | ')' | '['))
+        {
+            self.i += 1;
+        }
+        let text: String = self.s[start..self.i].iter().collect();
+        Selector::parse_with(text.trim(), Axis::Child)
+            .map_err(|e| perr(src, start, &format!("bad path in predicate ({e})")))
+    }
+
     fn predicate(&mut self, src: &str) -> Result<Pred> {
         self.ws();
         let pred = if self.peek().is_some_and(|c| c.is_ascii_digit()) {
@@ -235,48 +346,55 @@ impl Parser {
             Pred::Pos(n)
         } else if self.peek() == Some('@') {
             let name = self.attr_name(src)?;
-            self.ws();
-            let cond = if self.eat("!=") {
-                self.ws();
-                Cond::Ne(self.literal(src)?)
-            } else if self.eat("=") {
-                self.ws();
-                Cond::Eq(self.literal(src)?)
-            } else {
-                Cond::Exists
+            let cond = match self.operator() {
+                Some(op) => self.value(src, op)?,
+                None => Cond::Exists,
             };
             Pred::Attr { name, cond }
         } else {
+            let start = self.i;
             let f = self.ident();
-            if f != "contains" && f != "starts-with" {
-                return Err(perr(
-                    src,
-                    self.i,
-                    "unsupported predicate (use a position, @attr, contains(@a,'x') or starts-with(@a,'x'))",
-                ));
-            }
             self.ws();
-            if !self.eat("(") {
-                return Err(perr(src, self.i, "expected ("));
-            }
-            self.ws();
-            let name = self.attr_name(src)?;
-            self.ws();
-            if !self.eat(",") {
-                return Err(perr(src, self.i, "expected ,"));
-            }
-            self.ws();
-            let lit = self.literal(src)?;
-            self.ws();
-            if !self.eat(")") {
-                return Err(perr(src, self.i, "expected )"));
-            }
-            let cond = if f == "contains" {
-                Cond::Contains(lit)
+            if (f == "contains" || f == "starts-with") && self.eat("(") {
+                self.ws();
+                let attr = if self.peek() == Some('@') {
+                    Some(self.attr_name(src)?)
+                } else {
+                    None
+                };
+                let path = match attr {
+                    Some(_) => None,
+                    None => Some(self.rel_path(src)?),
+                };
+                self.ws();
+                if !self.eat(",") {
+                    return Err(perr(src, self.i, "expected ,"));
+                }
+                self.ws();
+                let lit = self.literal(src)?;
+                self.ws();
+                if !self.eat(")") {
+                    return Err(perr(src, self.i, "expected )"));
+                }
+                let cond = if f == "contains" {
+                    Cond::Contains(lit)
+                } else {
+                    Cond::StartsWith(lit)
+                };
+                match (attr, path) {
+                    (Some(name), _) => Pred::Attr { name, cond },
+                    (_, Some(path)) => Pred::Child { path, cond },
+                    _ => unreachable!(),
+                }
             } else {
-                Cond::StartsWith(lit)
-            };
-            Pred::Attr { name, cond }
+                self.i = start;
+                let path = self.rel_path(src)?;
+                let cond = match self.operator() {
+                    Some(op) => self.value(src, op)?,
+                    None => Cond::Exists,
+                };
+                Pred::Child { path, cond }
+            }
         };
         self.ws();
         if !self.eat("]") {
@@ -288,6 +406,11 @@ impl Parser {
 
 impl Selector {
     pub fn parse(src: &str) -> Result<Selector> {
+        Self::parse_with(src, Axis::Descendant)
+    }
+
+    /// `default_axis` applies to a first step with no leading slash.
+    fn parse_with(src: &str, default_axis: Axis) -> Result<Selector> {
         let mut p = Parser {
             s: src.chars().collect(),
             i: 0,
@@ -298,7 +421,7 @@ impl Selector {
         } else if p.eat("/") {
             Axis::Child
         } else {
-            Axis::Descendant
+            default_axis
         };
         let mut steps: Vec<Step> = Vec::new();
         let mut output = Output::Element;
@@ -375,6 +498,22 @@ impl Selector {
 
     pub fn select_str<'a>(&self, xml: &'a str) -> Select<std::io::Cursor<&'a [u8]>> {
         self.select(Reader::from_str(xml))
+    }
+
+    /// Runs against the children of `e`, so `e` itself plays the document node.
+    fn select_children(&self, e: &Element) -> Vec<Match> {
+        let mut engine = Engine::new(vec![self.clone()]);
+        let mut out = VecDeque::new();
+        let mut feed = |ev: Event| engine.feed(&ev, &mut out);
+        for n in &e.children {
+            match n {
+                Node::Element(c) => c.for_each_event(&mut feed),
+                Node::Text(t) => feed(Event::Text(t.clone())),
+                Node::CData(t) => feed(Event::CData(t.clone())),
+                Node::Comment(t) => feed(Event::Comment(t.clone())),
+            }
+        }
+        out.into_iter().map(|(_, m)| m).collect()
     }
 
     pub(crate) fn select_element(&self, e: &Element) -> Result<Vec<Match>> {
@@ -466,7 +605,9 @@ struct Frame {
 }
 
 enum CapKind {
-    Full,
+    /// Collects the whole subtree. With `deferred`, the element is a candidate for the step at
+    /// that index and is only reported (or searched further) if its child predicates hold.
+    Full { deferred: Option<usize> },
     Text,
 }
 
@@ -512,7 +653,7 @@ impl Engine {
                 let level = self.frames.len();
                 for c in &mut self.caps {
                     match c.kind {
-                        CapKind::Full => {
+                        CapKind::Full { .. } => {
                             let n = if cdata {
                                 Node::CData(t.clone())
                             } else {
@@ -527,7 +668,7 @@ impl Engine {
             }
             Event::Comment(t) => {
                 for c in &mut self.caps {
-                    if let CapKind::Full = c.kind {
+                    if let CapKind::Full { .. } = c.kind {
                         c.stack.last_mut().unwrap().children.push(Node::Comment(t.clone()));
                     }
                 }
@@ -555,6 +696,7 @@ impl Engine {
 
         let mut next_states = Vec::with_capacity(self.sels.len());
         let mut hits = Vec::new();
+        let mut candidates = Vec::new();
         for (si, sel) in self.sels.iter().enumerate() {
             let mut ns = Vec::new();
             for &i in &parent.states[si] {
@@ -563,7 +705,9 @@ impl Engine {
                     ns.push(i);
                 }
                 if step.matches(name, attrs, pos) {
-                    if i + 1 == sel.steps.len() {
+                    if step.has_deferred() {
+                        candidates.push((si, i));
+                    } else if i + 1 == sel.steps.len() {
                         hits.push(si);
                     } else {
                         ns.push(i + 1);
@@ -576,7 +720,7 @@ impl Engine {
         }
 
         for c in &mut self.caps {
-            if let CapKind::Full = c.kind {
+            if let CapKind::Full { .. } = c.kind {
                 c.stack.push(Element::with_attrs(name, attrs.to_vec()));
             }
         }
@@ -585,6 +729,17 @@ impl Engine {
             counts: Vec::new(),
         });
         let level = self.frames.len();
+        for (si, step) in candidates {
+            self.caps.push(Capture {
+                sel: si,
+                kind: CapKind::Full {
+                    deferred: Some(step),
+                },
+                level,
+                stack: vec![Element::with_attrs(name, attrs.to_vec())],
+                text: String::new(),
+            });
+        }
         for si in hits {
             match &self.sels[si].output {
                 Output::Attr(a) => {
@@ -594,7 +749,7 @@ impl Engine {
                 }
                 Output::Element => self.caps.push(Capture {
                     sel: si,
-                    kind: CapKind::Full,
+                    kind: CapKind::Full { deferred: None },
                     level,
                     stack: vec![Element::with_attrs(name, attrs.to_vec())],
                     text: String::new(),
@@ -615,14 +770,17 @@ impl Engine {
         let mut keep = Vec::with_capacity(self.caps.len());
         for mut c in self.caps.drain(..) {
             match c.kind {
-                CapKind::Full => {
+                CapKind::Full { deferred } => {
                     let el = c.stack.pop().unwrap();
                     match c.stack.last_mut() {
                         Some(parent) => {
                             parent.children.push(Node::Element(el));
                             keep.push(c);
                         }
-                        None => out.push_back((c.sel, Match::Element(el))),
+                        None => match deferred {
+                            None => out.push_back((c.sel, Match::Element(el))),
+                            Some(i) => finish_deferred(&self.sels[c.sel], c.sel, i, el, out),
+                        },
                     }
                 }
                 CapKind::Text if c.level == level => {
@@ -635,5 +793,42 @@ impl Engine {
         }
         self.caps = keep;
         self.frames.pop();
+    }
+}
+
+/// A candidate element has been read in full: check its child predicates and, if they hold,
+/// report it (last step) or look for the rest of the path inside it.
+fn finish_deferred(
+    sel: &Selector,
+    si: usize,
+    i: usize,
+    el: Element,
+    out: &mut VecDeque<(usize, Match)>,
+) {
+    if !sel.steps[i].deferred_hold(&el) {
+        return;
+    }
+    if i + 1 < sel.steps.len() {
+        let rest = Selector {
+            steps: sel.steps[i + 1..].to_vec(),
+            output: sel.output.clone(),
+            source: sel.source.clone(),
+        };
+        out.extend(rest.select_children(&el).into_iter().map(|m| (si, m)));
+        return;
+    }
+    match &sel.output {
+        Output::Element => out.push_back((si, Match::Element(el))),
+        Output::Attr(a) => {
+            if let Some(v) = el.attr(a) {
+                out.push_back((si, Match::Attr(v.to_string())));
+            }
+        }
+        Output::Text => {
+            let t = el.direct_text();
+            if !t.is_empty() {
+                out.push_back((si, Match::Text(t)));
+            }
+        }
     }
 }
