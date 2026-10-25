@@ -329,19 +329,20 @@ fn gate_refuses_before_buffering() {
     // The same limit that errored above is fine when the gate keeps the big one out.
     let mut seen = 0;
     let mut kinds = vec![];
-    let stats = Router::new()
-        .limits(Limits { max_element_bytes: 1000, ..Default::default() })
+    let mut router = Router::new().limits(Limits { max_element_bytes: 1000, ..Default::default() });
+    let stats = router
         .on_gated(
             "//order",
-            |tag| tag.attr("kind") == Some("small"),
-            |m| {
+            |tag, _| tag.attr("kind") == Some("small"),
+            |m, _| {
                 seen += 1;
                 kinds.push(m.as_element().unwrap().attr("kind").unwrap().to_string());
                 Ok(Flow::Continue)
             },
         )
-        .and_then(|r| r.run(Reader::from_str(&big_doc())))
+        .and_then(|_| router.run(Reader::from_str(&big_doc())))
         .unwrap();
+    drop(router);
     assert_eq!(seen, 1000);
     assert!(kinds.iter().all(|k| k == "small"));
     assert_eq!(stats.skipped, 0);
@@ -352,12 +353,13 @@ fn router_dispatches_and_stops() {
     let (mut ids, mut skus) = (vec![], vec![]);
     let mut router = Router::new();
     router
-        .on("//order/@id", |m| {
+        .on("//order/@id", |m, _| {
             ids.push(m.to_text());
             Ok(if ids.len() == 2 { Flow::Stop } else { Flow::Continue })
         })
-        .unwrap()
-        .on("//sku/text()", |m| {
+        .unwrap();
+    router
+        .on("//sku/text()", |m, _| {
             skus.push(m.to_text());
             Ok(Flow::Continue)
         })
@@ -376,11 +378,11 @@ fn router_reports_skips_and_handler_errors() {
         on_overflow: Overflow::Skip,
         ..Default::default()
     });
-    router.on("//order", |_| Ok(Flow::Continue)).unwrap();
+    router.on("//order", |_, _| Ok(Flow::Continue)).unwrap();
     assert_eq!(router.run(Reader::from_str(&big_doc())).unwrap().skipped, 1);
 
     let mut router = Router::new();
-    router.on("//order", |_| Err(Error::other("nope"))).unwrap();
+    router.on("//order", |_, _| Err(Error::other("nope"))).unwrap();
     assert!(router.run(Reader::from_str(DOC)).is_err());
 }
 
@@ -403,11 +405,105 @@ fn many_routes_share_one_forward_pass() {
     let read = std::rc::Rc::new(std::cell::Cell::new(0));
     let (mut a, mut b, mut c) = (0, 0, 0);
     let mut router = Router::new();
-    router.on("//order", |_| { a += 1; Ok(Flow::Continue) }).unwrap();
-    router.on("//sku/text()", |_| { b += 1; Ok(Flow::Continue) }).unwrap();
-    router.on("//order[sku='5']/@id", |_| { c += 1; Ok(Flow::Continue) }).unwrap();
+    router.on("//order", |_, _| { a += 1; Ok(Flow::Continue) }).unwrap();
+    router.on("//sku/text()", |_, _| { b += 1; Ok(Flow::Continue) }).unwrap();
+    router.on("//order[sku='5']/@id", |_, _| { c += 1; Ok(Flow::Continue) }).unwrap();
     router.run(Reader::new(Counting(doc.as_bytes(), read.clone()))).unwrap();
     drop(router);
     assert_eq!((a, b, c), (1001, 1000, 1));
     assert_eq!(read.get(), doc.len(), "each byte read exactly once");
+}
+
+use std::{cell::RefCell, rc::Rc};
+
+const EU_US: &str = "<r>\
+<order type='eu'><vat>19</vat><note>n1</note></order>\
+<order type='us'><vat>7</vat></order>\
+<order type='eu'><vat>21</vat></order></r>";
+
+// A route added from inside a callback outlives that call, so it cannot borrow the callback's
+// captures; shared state goes through Rc<RefCell<..>>.
+
+#[test]
+fn scoped_route_added_from_a_start_tag() {
+    // Only inside an EU order do we start looking at <vat>; the route dies with the order.
+    let vats = Rc::new(RefCell::new(vec![]));
+    let mut router = Router::new();
+    let v = vats.clone();
+    router
+        .on("//order/@type", move |m, ctl| {
+            if m.to_text() == "eu" {
+                let v = v.clone();
+                ctl.route("vat/text()").scoped().on(move |m, _| {
+                    v.borrow_mut().push(m.to_text());
+                    Ok(Flow::Continue)
+                })?;
+            }
+            Ok(Flow::Continue)
+        })
+        .unwrap();
+    router.run(Reader::from_str(EU_US)).unwrap();
+    assert_eq!(*vats.borrow(), ["19", "21"]);
+}
+
+#[test]
+fn unscoped_route_lives_until_removed() {
+    let seen = Rc::new(RefCell::new(vec![]));
+    let mut router = Router::new();
+    let s = seen.clone();
+    router
+        .on("//order/@type", move |m, ctl| {
+            if m.to_text() == "eu" && s.borrow().is_empty() {
+                let s = s.clone();
+                ctl.route("//vat/text()").on(move |m, ctl| {
+                    s.borrow_mut().push(m.to_text());
+                    if s.borrow().len() == 2 {
+                        ctl.remove_this();
+                    }
+                    Ok(Flow::Continue)
+                })?;
+            }
+            Ok(Flow::Continue)
+        })
+        .unwrap();
+    router.run(Reader::from_str(EU_US)).unwrap();
+    // added inside the first order, not scoped: sees its own vat, the us vat, then removes itself
+    assert_eq!(*seen.borrow(), ["19", "7"]);
+}
+
+#[test]
+fn gate_switches_logic_on_for_a_section() {
+    // A gate on the section tag turns on a detail route; it expires when the section closes.
+    let doc = "<r><log><e k='a'/></log><detail><e k='b'/><e k='c'/></detail><log><e k='d'/></log></r>";
+    let got = Rc::new(RefCell::new(vec![]));
+    let mut router = Router::new();
+    let g = got.clone();
+    router
+        .on_gated(
+            "/r/detail",
+            move |_, ctl| {
+                let g = g.clone();
+                let _ = ctl.route("e/@k").scoped().on(move |m, _| {
+                    g.borrow_mut().push(m.to_text());
+                    Ok(Flow::Continue)
+                });
+                false // the section itself is not needed, only what the gate switched on
+            },
+            |_, _| Ok(Flow::Continue),
+        )
+        .unwrap();
+    router.run(Reader::from_str(doc)).unwrap();
+    assert_eq!(*got.borrow(), ["b", "c"]);
+}
+
+#[test]
+fn bad_dynamic_path_is_an_error_not_a_panic() {
+    let mut router = Router::new();
+    router
+        .on("//order", |_, ctl| {
+            ctl.route("a[").on(|_, _| Ok(Flow::Continue))?;
+            Ok(Flow::Continue)
+        })
+        .unwrap();
+    assert!(router.run(Reader::from_str(EU_US)).is_err());
 }

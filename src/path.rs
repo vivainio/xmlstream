@@ -556,6 +556,12 @@ impl Selector {
         })
     }
 
+    /// For routes added while parsing: a path with no `//` is relative to the open element, so
+    /// `vat` means its child `vat` (the way predicate paths read).
+    pub(crate) fn parse_relative(src: &str) -> Result<Selector> {
+        Self::parse_with(src, Axis::Child)
+    }
+
     pub fn as_str(&self) -> &str {
         &self.source
     }
@@ -729,6 +735,8 @@ pub(crate) struct Engine {
     frames: Vec<Frame>,
     caps: Vec<Capture>,
     needs_pos: bool,
+    /// Routes can be switched off while parsing; their slot stays so indexes stay stable.
+    active: Vec<bool>,
     limits: Limits,
     total: usize,
     pub(crate) skipped: u64,
@@ -745,8 +753,10 @@ impl Engine {
             states: vec![vec![0]; sels.len()],
             counts: Vec::new(),
         };
+        let active = vec![true; sels.len()];
         Engine {
             sels,
+            active,
             frames: vec![root],
             caps: Vec::new(),
             needs_pos,
@@ -812,6 +822,45 @@ impl Engine {
         Ok(())
     }
 
+    /// Number of open elements, plus one for the document itself.
+    pub(crate) fn depth(&self) -> usize {
+        self.frames.len()
+    }
+
+    /// Adds a selector mid-stream and returns its index. A `scoped` selector starts from the
+    /// element that is open right now: its first step is tried on that element's children. An
+    /// unscoped one is tried on everything that opens from now on, at any depth.
+    pub(crate) fn add_selector(&mut self, sel: Selector, scoped: bool) -> usize {
+        let idx = self.sels.len();
+        self.needs_pos |= sel
+            .steps
+            .iter()
+            .any(|st| st.preds.iter().any(|p| matches!(p, Pred::Pos(_))));
+        self.sels.push(sel);
+        self.active.push(true);
+        let from = if scoped { self.frames.len() - 1 } else { 0 };
+        for frame in &mut self.frames[from..] {
+            frame.states.resize(idx + 1, Vec::new());
+            frame.states[idx] = vec![0];
+        }
+        idx
+    }
+
+    /// Switches a selector off and drops whatever it was still buffering.
+    pub(crate) fn deactivate(&mut self, idx: usize) {
+        self.active[idx] = false;
+        let mut freed = 0;
+        self.caps.retain(|c| {
+            if c.sel == idx {
+                freed += c.bytes;
+                false
+            } else {
+                true
+            }
+        });
+        self.total = self.total.saturating_sub(freed);
+    }
+
     /// Applies the memory budget: fails, or drops the largest offending candidate.
     fn enforce(&mut self) -> Result<()> {
         loop {
@@ -872,7 +921,12 @@ impl Engine {
         let mut candidates = Vec::new();
         for (si, sel) in self.sels.iter().enumerate() {
             let mut ns = Vec::new();
-            for &i in &parent.states[si] {
+            let tried: &[usize] = if self.active[si] {
+                parent.states.get(si).map_or(&[], Vec::as_slice)
+            } else {
+                &[]
+            };
+            for &i in tried {
                 let step = &sel.steps[i];
                 if step.axis == Axis::Descendant {
                     ns.push(i);

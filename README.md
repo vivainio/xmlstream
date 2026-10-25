@@ -129,10 +129,10 @@ let mut router = Router::new().limits(Limits {
 
 router.on_gated(
     "//order[sku='a']",
-    |tag| tag.attr("region") == Some("eu"),   // decided from the tag alone: no buffering if false
-    |m| { handle(m.into_element().unwrap()); Ok(Flow::Continue) },
+    |tag, _| tag.attr("region") == Some("eu"),   // decided from the tag alone: no buffering if false
+    |m, _| { handle(m.into_element().unwrap()); Ok(Flow::Continue) },
 )?;
-router.on("//audit/@user", |m| { log(m.to_text()); Ok(Flow::Continue) })?;
+router.on("//audit/@user", |m, _| { log(m.to_text()); Ok(Flow::Continue) })?;
 
 let stats = router.run(Reader::new(file))?;   // one pass; stats.skipped = dropped candidates
 ```
@@ -152,6 +152,51 @@ let stats = router.run(Reader::new(file))?;   // one pass; stats.skipped = dropp
 - **Handlers run in event order**, as matches complete (element matches at the
   closing tag, attribute matches at the start tag). A handler error ends the run.
 - **`Flow::Stop` ends the whole run**, for every route. Nothing more is parsed.
+
+### Switching logic while parsing
+
+Every gate and handler also receives a `Control`, which changes the set of routes
+while the parse carries on. It is a state machine driven by the document:
+
+```rust
+use std::{cell::RefCell, rc::Rc};
+
+let vats = Rc::new(RefCell::new(Vec::new()));
+let mut router = Router::new();
+let v = vats.clone();
+router.on("//order/@type", move |m, ctl| {
+    if m.to_text() == "eu" {
+        let v = v.clone();
+        // watch <vat> only inside this order; the route removes itself when the order closes
+        ctl.route("vat/text()").scoped().on(move |m, _| {
+            v.borrow_mut().push(m.to_text());
+            Ok(Flow::Continue)
+        })?;
+    }
+    Ok(Flow::Continue)
+})?;
+router.run(Reader::new(file))?;
+```
+
+- `ctl.route(path)` starts a new route. Add `.gate(..)` for a start-tag gate and
+  `.on(handler)` to finish. It returns a `RouteId`.
+- **Unscoped** (the default): the route applies to everything that follows in the
+  document. Its first step is tried on every element that opens from now on, so
+  `vat` and `//vat` both find a `vat` at any depth. Positions (`[2]`) count only
+  siblings seen after it was added.
+- **`.scoped()`**: the route is anchored to the element that is open when it is
+  added, and removed when that element closes. From a gate that is the element
+  whose start tag matched, so `vat` means its child and `//vat` any descendant.
+  From a handler for an element match (which fires at the closing tag) it is the
+  parent.
+- `ctl.remove(id)` and `ctl.remove_this()` switch a route off; anything it was
+  still buffering is dropped. `ctl.this_route()` gives the current route's id.
+- Changes apply from the next event on, so a route added by a gate sees the
+  children of the element the gate looked at, and the stream is never rewound.
+- Added routes share the router's memory budget.
+- A route added from a callback outlives that call, so its closure cannot borrow
+  the callback's variables. Share state with `Rc<RefCell<..>>`, or move owned
+  values in.
 
 The same budget works without a router: `Selector::select_with(reader, limits)`
 and `SelectorSet::limits(limits)`.
